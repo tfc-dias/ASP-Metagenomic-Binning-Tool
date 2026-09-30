@@ -1,0 +1,2370 @@
+#include "metabat2.h"
+
+std::ifstream::pos_type filesize(const char *filename) {
+  std::ifstream in(filename, std::ifstream::ate | std::ifstream::binary);
+  return in.tellg();
+}
+
+int main(int ac, char *av[]) {
+  po::options_description desc("Allowed options", 110, 110 / 2);
+  desc.add_options()                     //
+      ("help,h", "produce help message") //
+      ("inFile,i", po::value<std::string>(&inFile),
+       "Contigs in (gzipped) fasta file format [Mandatory]") //
+      ("outFile,o", po::value<std::string>(&outFile),
+       "Base file name and path for each bin. The default output is fasta "
+       "format. Use -l option to output only contig names [Mandatory].") //
+      ("abdFile,a", po::value<std::string>(&abdFile),
+       "A file having mean and variance of base coverage depth (tab delimited; "
+       "the first column should be contig names, and the first row will be "
+       "considered as the header and be skipped) [Optional].") //
+      ("minContig,m", po::value<size_t>(&minContig)->default_value(2500),
+       "Minimum size of a contig for binning (should be >=1500).") //
+      ("minSmallContig",
+       po::value<size_t>(&minSmallContig)->default_value(1000),
+       "Minimum size of a small contig for recruiting into established bins "
+       "(should be >=500)") //
+      ("maxP", po::value<Similarity>(&maxP)->default_value(95),
+       "Percentage of 'good' contigs considered for binning decided by "
+       "connection among contigs. The greater, the more sensitive.") //
+      ("minS", po::value<Similarity>(&minS)->default_value(60),
+       "Minimum score of a edge for binning (should be between 1 and 99). The "
+       "greater, the more specific.") //
+      ("maxEdges", po::value<size_t>(&maxEdges)->default_value(200),
+       "Maximum number of edges per node. The greater, the more sensitive.") //
+      ("pTNF", po::value<Similarity>(&pTNF)->default_value(0),
+       "TNF probability cutoff for building TNF graph. Use a %% value between "
+       "1 and 100 "
+       "to skip the auto preparation step. (0: auto).") //
+      ("noAdd", po::value<bool>(&noAdd)->zero_tokens(),
+       "Turning off additional binning for lost or small contigs.") //
+      ("minRecruitingSize", po::value<size_t>(&minCS)->default_value(10),
+       "(if not noAdd) Minimum cluster size for recruiting of small and "
+       "leftover contigs") //
+      ("recruitToAbdCentroid",
+       po::value<bool>(&recruitToAbdCentroid)
+           ->default_value(false)
+           ->zero_tokens(),
+       "[EXPERIMENTAL] If set (and not noAdd), use the weighted-by-abundance "
+       "centroid of a cluster to recruit small and lost contigs.  Potentially "
+       "reduces sensitivity and improves speed") //
+      ("recruitWithTNF",
+       po::value<Distance>(&recruitWithTNFMin)->default_value(0.0),
+       "[EXPERIMENTAL] If non-zero (and not noAdd), uses this factor "
+       "against the large-contig TNF threshold to require small and lost "
+       "contigs have at least that TNF distance from the centroid of the "
+       "recruiting cluster. Recommend 0.9-1.0.") //
+      ("cvExt", po::value<bool>(&cvExt)->zero_tokens(),
+       "When a coverage file without variance (from third party tools) is used "
+       "instead of abdFile from jgi_summarize_bam_contig_depths.") //
+      ("fullHeader", po::value<bool>(&fullHeader)->zero_tokens(),
+       "Preserve full FASTA headers from input assembly (default: trim at first space).") //
+      ("minCV,x", po::value<Distance>(&minCV)->default_value(1),
+       "Minimum mean coverage of a contig in each library for binning.") //
+      ("minCVSum", po::value<Distance>(&minCVSum)->default_value(1),
+       "Minimum total effective mean coverage of a contig (sum of depth over "
+       "minCV) for binning.") //
+      ("minClsSize,s", po::value<size_t>(&minClsSize)->default_value(200000),
+       "Minimum size of a bin as the output.") //
+      ("numThreads,t", po::value<size_t>(&numThreads)->default_value(0),
+       "Number of threads to use (0: use all cores).") //
+      ("onlyLabel,l", po::value<bool>(&onlyLabel)->zero_tokens(),
+       "Output only sequence labels as a list in a column without "
+       "sequences.") //
+      ("saveCls", po::value<bool>(&saveCls)->zero_tokens(),
+       "Save cluster memberships as a matrix format") //
+      ("unbinned", po::value<bool>(&outUnbinned)->zero_tokens(),
+       "Generate [outFile].unbinned.fa file for unbinned contigs") //
+      ("noBinOut", po::value<bool>(&noBinOut)->zero_tokens(),
+       "No bin output. Usually combined with --saveCls to check only contig "
+       "memberships")
+       ("noSampleDepths", po::value<bool>(&noSampleDepths)->zero_tokens(),
+       "Do not include per-sample depths in bin fasta headers") //
+                      /**
+                     ("mergeSamplesCosign",
+                      po::value<Distance>(&mergeSamplesCosign)->default_value(1.0),
+                      "[EXPERIMENTAL] If < 1.0 combine similar/colinear sample "
+                      "abundances where the dot-produce >= mergeSamplesCosign") //
+                      */
+      ("seed", po::value<unsigned long long>(&seed)->default_value(0),
+       "For exact reproducibility. (0: use random seed)")                 //
+      ("debug,d", po::value<bool>(&debug)->zero_tokens(), "Debug output") //
+      ("quiet,q", po::value<bool>(&quiet)->zero_tokens(),
+       "Be less verbose verbose output")(
+          "verbose,v", po::value<bool>(&verbose)->zero_tokens(),
+          "Be more verbose in output (on by default)");
+
+  po::variables_map vm;
+  po::store(po::command_line_parser(ac, av).options(desc).positional({}).run(),
+            vm);
+  po::notify(vm);
+
+  if (vm.count("help") || inFile.length() == 0 || outFile.length() == 0) {
+    cerr << "\nMetaBAT: Metagenome Binning based on Abundance and "
+            "Tetranucleotide frequency (version 2:"
+         << version << "; " << DATE << ")" << endl;
+    cerr << "by Don Kang (ddkang@lbl.gov), Feng Li, Jeff Froula, Rob Egan, and "
+            "Zhong Wang (zhongwang@lbl.gov) \n"
+         << endl;
+    cerr << desc << endl << endl;
+
+    if (!vm.count("help")) {
+      if (inFile.empty()) {
+        cerr << "[Error!] There was no --inFile specified" << endl;
+      }
+      if (outFile.empty()) {
+        cerr << "[Error!] There was no --outFile specified" << endl;
+      }
+    }
+
+    return vm.count("help") ? 0 : 1;
+  }
+
+  if (quiet && verbose)
+    verbose = false; // quiet overrides verbose
+  else
+    verbose = true; // by default be more verbose
+
+  if (verbose)
+    gettimeofday(&t1, NULL);
+
+  if (seed == 0)
+    seed = time(0);
+  srand(seed);
+
+  if (maxP <= 0 || maxP >= 100) {
+    cerr << "[Error!] maxP should be greater than 0 and less than 100" << endl;
+    return 1;
+  }
+
+  if (minS <= 1 || minS >= 100) {
+    cerr << "[Error!] minS should be greater than 1 and less than 100" << endl;
+    return 1;
+  }
+
+  if (pTNF < 0 || pTNF >= 100) {
+    cerr << "[Error!] pTNF should be >= 0 and < 100" << endl;
+    return 1;
+  }
+
+  if (minContig < 1500) {
+    cerr << "[Error!] Contig length < 1500 is not allowed to be used for "
+            "binning."
+         << endl;
+    return 1;
+  }
+
+  if (minSmallContig < 500) {
+    cerr << "[Error!] Min small contig length < 500 is not allowed for use in "
+            "binning"
+         << endl;
+    return 1;
+  }
+
+  if (minCV < 0) {
+    cerr << "[Error!] minCV should be non-negative" << endl;
+    return 1;
+  }
+  minCVSum = std::max(minCV, minCVSum);
+
+  boost::filesystem::path dir(outFile);
+  boost::system::error_code ec;
+  if (dir.parent_path().string().length() > 0) {
+    if (boost::filesystem::is_regular_file(dir.parent_path())) {
+      cerr << "Cannot create directory: " << dir.parent_path().string()
+           << ", which exists as a regular file." << endl;
+      return 1;
+    }
+    if (!boost::filesystem::is_directory(dir.parent_path()) &&
+        !boost::filesystem::create_directory(dir.parent_path(), ec)) {
+      cerr << "Cannot create directory: " << dir.parent_path().string() << ": "
+           << ec << endl;
+      return 1;
+    }
+  }
+
+  print_message("MetaBAT 2 (%s) using minContig %d, minCV %2.1f, minCVSum "
+                "%2.1f, maxP %2.0f%%, minS %2.0f, maxEdges %d and minClsSize "
+                "%d. with random seed=%lld\n",
+                version.c_str(), minContig, minCV, minCVSum, maxP, minS,
+                maxEdges, minClsSize, seed);
+
+  maxP /= 100., minS /= 100.;
+
+  if (numThreads == 0)
+    numThreads = omp_get_max_threads();
+  else
+    numThreads = std::min(numThreads, (size_t)omp_get_max_threads());
+  omp_set_num_threads(numThreads);
+  verbose_message("Executing with %d threads\n", numThreads);
+
+  // initialize the TN data structures
+  for (size_t i = 0; i < nTNF; ++i) {
+    TNmap[TN[i]] = i;
+  }
+
+  for (size_t i = 0; i < 16; ++i) {
+    TNPmap.insert(TNP[i]);
+  }
+
+  TNLookup.resize(257);
+  TNLookup[256] = nTNF; // any non-base in the kmer
+  char tnfSeq[5] = {0, 0, 0, 0, 0};
+  for (int i0 = 0; i0 < 4; i0++) {
+    tnfSeq[0] = bases[i0];
+    for (int i1 = 0; i1 < 4; i1++) {
+      tnfSeq[1] = bases[i1];
+      for (int i2 = 0; i2 < 4; i2++) {
+        tnfSeq[2] = bases[i2];
+        for (int i3 = 0; i3 < 4; i3++) {
+          tnfSeq[3] = bases[i3];
+          char tn[5] = {0, 0, 0, 0, 0};
+          memcpy(tn, tnfSeq, 4);
+          int tnNumber = tnToNumber(tnfSeq);
+          assert(tnNumber <= 255);
+
+          auto it = TNmap.find(tn);
+          if (it != TNmap.end()) {
+            TNLookup[tnNumber] = it->second;
+            continue;
+          }
+
+          // reverse complement
+          std::reverse(tn, tn + 4);
+          if (!revComp(tn, 4)) {
+            cout << "Unknown nucleotide letter found: " << tn << endl;
+            continue;
+          }
+          if (TNPmap.find(tn) ==
+              TNPmap.end()) { // if it is palindromic, then skip
+            it = TNmap.find(tn);
+            if (it != TNmap.end()) {
+              TNLookup[tnNumber] = it->second;
+            } else {
+              cout << "Unknown TNF " << tn << endl;
+              continue;
+            }
+          } else {
+            TNLookup[tnNumber] = nTNF; // skip
+          }
+        }
+      }
+    }
+  }
+
+  nobs = 0, nobs1 = 0;
+
+  std::unordered_map<std::string, size_t> contigs;
+  std::unordered_map<std::string, size_t> small_contigs;
+
+  const int nNonFeat = cvExt ? 1 : 3; // number of non features
+  bool hasABD = abdFile.length() > 0;
+
+  // validate fasta and depths file (abd) have same set of sequence identifiers
+  // (in same ordering)
+  {
+    // need to handle the case where more data in assembly.fa than depth.txt
+    // (but contigs should be in order)
+
+    // todo refactor into validate depths file method
+    if (hasABD) {
+      verbose_message("Parsing abundance file header [%.1fGb / %.1fGb]\n",
+                      getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+      nABD =
+          ncols(abdFile.c_str(), 1) -
+          nNonFeat; // num of features (excluding the first three columns which
+                    // is the contigName, contigLen, and totalAvgDepth);
+      if (!cvExt) {
+        if (nABD % 2 != 0) {
+          cerr << "[Error!] Number of columns (excluding the first column) in "
+                  "abundance data file is not even."
+               << endl;
+          exit(1);
+        }
+        nABD /= 2;
+      }
+    }
+
+    verbose_message("Parsing assembly file [%.1fGb / %.1fGb]\n",
+                    getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+    size_t num_seqs = 0;
+
+    // TODO refactor into read assembly method
+    size_t inFileSize = filesize(inFile.c_str());
+    if (inFile.find_last_of(".gz") == std::string::npos) {
+      inFileSize *= 4; // approximately 4x gzip compression
+      verbose_message("Estimating uncompressed size of %s as 4x: %ld\n", inFile,
+                      inFileSize);
+    }
+
+    ProgressTracker in_progress(inFileSize);
+    gzFile f = gzopen(inFile.c_str(), "r");
+    if (f == NULL) {
+      cerr << "[Error!] can't open the sequence fasta file " << inFile << endl;
+      return 1;
+    } else {
+      std::ofstream *os = NULL;
+      char os_buffer[buf_size];
+      std::string filteredFile_cls;
+      if (outUnbinned) {
+        filteredFile_cls = outFile + ".";
+        filteredFile_cls.append("tooShort");
+        if (!onlyLabel) {
+          filteredFile_cls.append(".fa");
+        }
+        os = new std::ofstream(filteredFile_cls.c_str());
+        if (!os->is_open() || os->fail() || !*os) {
+          cerr << "[Error!] can't open the output bin file: "
+               << filteredFile_cls << endl;
+          return 1;
+        }
+        os->rdbuf()->pubsetbuf(os_buffer, buf_size);
+        if (verbose)
+          verbose_message("Outputting contigs that are too short to %s\n",
+                          filteredFile_cls.c_str());
+      }
+
+      kseq_t *kseq = kseq_init(f);
+      int64_t len;
+      while ((len = kseq_read(kseq)) > 0) {
+        in_progress.track(len + 1);
+        if (in_progress.isStepMarker()) {
+          verbose_message("... processed %ld seqs, %ld long (>=%d), %ld short "
+                          "(>=1000) %s [%.1fGb / %.1fGb]     \r",
+                          num_seqs, contig_names.size(), minContig,
+                          small_contig_names.size(), in_progress.getProgress(),
+                          getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+        }
+        if (kseq->name.l > 0)
+          num_seqs++;
+        if (kseq->name.l > 0) {
+          std::string contig_name = std::string(kseq->name.s);
+          if (fullHeader && kseq->comment.l > 0) contig_name += " " + std::string(kseq->comment.s);
+          char *s = kseq->seq.s;
+          // toupper is no longer necessary to enumerate TNF
+          if (len >= (int)minContig) {
+            auto n = nobs++;
+            auto x = contigs.insert({contig_name, n});
+            if (!x.second) {
+              cerr << "[Error!] found duplicate contig: " << contig_name
+                   << endl;
+              return 1;
+            }
+            contig_names.push_back(contig_name);
+            seqs.push_back(kseq->seq.s);
+          } else if (len >= (int)minSmallContig) {
+            auto n = nobs1++;
+            auto x = small_contigs.insert({contig_name, n});
+            if (!x.second) {
+              cerr << "[Error!] found duplicate small contig: " << contig_name
+                   << endl;
+              return 1;
+            }
+            small_contig_names.push_back(contig_name);
+            small_seqs.push_back(kseq->seq.s);
+          } else if (os) {
+            // output the filtered contigs
+            if (onlyLabel) {
+              *os << contig_name << line_delim;
+            } else {
+              printFasta(*os, contig_name, kseq->seq.s);
+            }
+          }
+        }
+      }
+      kseq_destroy(kseq);
+      kseq = NULL;
+      gzclose(f);
+      if (os) {
+        os->close();
+        if (!*os) {
+          cerr << "[Error!] Failed to write to " << filteredFile_cls << endl;
+          return 1;
+        }
+        delete os;
+      }
+    }
+  }
+
+  if (contig_names.size() != contigs.size() ||
+      small_contig_names.size() != small_contigs.size()) {
+    cerr << "[Error!] Need to check whether there are duplicated sequence ids "
+            "in the assembly file"
+         << endl;
+    return 1;
+  }
+  verbose_message("Number of large contigs >= %d bp are %d, and small contigs "
+                  ">= 1000 bp are %d                                          "
+                  "                        \n",
+                  minContig, nobs, nobs1);
+
+  if (hasABD) {
+    verbose_message(
+        "Allocating %ld contigs by %d samples abundances [%.1fGb / %.1fGb]\n",
+        nobs, nABD, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+    ABD.resize(nobs, nABD);
+    verbose_message(
+        "Allocating %ld contigs by %d samples variances [%.1fGb / %.1fGb]\n",
+        nobs, nABD, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+    ABD_VAR.resize(nobs, nABD);
+    verbose_message("Allocating %ld small contigs by %d samples abundances "
+                    "[%.1fGb / %.1fGb]\n",
+                    nobs1, nABD, getUsedPhysMem(),
+                    getTotalPhysMem() / 1024 / 1024);
+    small_ABD.resize(nobs1, nABD);
+
+    size_t abdFileSize = filesize(abdFile.c_str());
+    verbose_message("Reading %.6fGb abundance file [%.1fGb / %.1fGb]\n",
+                    abdFileSize / 1024. / 1024. / 1024., getUsedPhysMem(),
+                    getTotalPhysMem() / 1024 / 1024);
+    std::ifstream is(abdFile.c_str());
+    if (!is.is_open()) {
+      cerr << "[Error!] can't open the contig coverage depth file " << abdFile
+           << endl;
+      return 1;
+    }
+    ProgressTracker abd_progress(abdFileSize);
+
+    int64_t r = -1, ignored_too_small = 0;
+    size_t num = 0, num1 = 0, nskip = 0, nskip1 = 0;
+
+    std::ofstream *os = NULL;
+    char os_buffer[buf_size];
+    std::string filteredFile_cls;
+    if (outUnbinned) {
+      filteredFile_cls = outFile + ".";
+      filteredFile_cls.append("lowDepth");
+      if (!onlyLabel) {
+        filteredFile_cls.append(".fa");
+      }
+      os = new std::ofstream(filteredFile_cls.c_str());
+      if (!os->is_open() || os->fail() || !*os) {
+        cerr << "[Error!] Failed to open to " << filteredFile_cls << endl;
+        return 1;
+      }
+      os->rdbuf()->pubsetbuf(os_buffer, buf_size);
+      if (verbose)
+        verbose_message("Outputting contigs that are too low depth to %s\n",
+                        filteredFile_cls.c_str());
+    }
+    // todo refactor reading file
+    for (std::string row; safeGetline(is, row) && is.good(); ++r) {
+      abd_progress.track(row.size() + 1);
+      if (abd_progress.isStepMarker()) {
+        verbose_message("... processed %ld lines %ld contigs and %ld short "
+                        "contigs %s [%.1fGb / %.1fGb]                 \r",
+                        num + nskip + num1 + nskip1, num, num1,
+                        abd_progress.getProgress(), getUsedPhysMem(),
+                        getTotalPhysMem() / 1024 / 1024);
+      }
+      if (r == -1) // the first row is header
+        continue;
+
+      // std::stringstream ss(row);
+      int c = -nNonFeat;
+      CALC_TYPE mean = 0, variance;
+      double meanSum = 0;
+      std::string label;
+      bool isLarge = false, isGood = false, isSmall = false;
+
+      // use C's strtod (const char* str, char** endptr)
+      // instead of getline & lexical_cast
+      const char *c_row = row.c_str();
+      char *next_field = nullptr;
+      size_t p = row.find_first_of(tab_delim), old_p = 0;
+      if (p == std::string::npos) {
+        cerr << "[Error!] could not find tab in line " << r
+             << " of abundance file: " << row << endl;
+        return 1;
+      }
+      ++c;
+
+      label = row.substr(old_p, p);
+      if (!fullHeader) trim_fasta_label(label);
+
+      for (; c < 0; ++c) {
+        old_p = p + 1;
+        p = row.find_first_of(tab_delim, old_p);
+        if (p == std::string::npos) {
+          cerr << "[Error!] could not find tab in line " << r
+               << " of abundance file: " << row << endl;
+          return 1;
+        }
+      }
+
+      if (contigs.find(label) == contigs.end()) { // small or additional contigs
+        if (small_contigs.find(label) == small_contigs.end()) {
+          ignored_too_small++;
+          continue; // ignore this contig
+         } else
+          isSmall = true;
+      } else
+        isLarge = true;
+
+      if ((isSmall && small_contigs[label] != num1) ||
+          (isLarge && contigs[label] != num)) {
+        cerr << "[Error!] the order of contigs in abundance file is not the "
+                "same as the assembly file: "
+             << label << endl;
+        exit(1);
+      }
+      isGood = true;
+
+      for (; p < row.size(); ++c) {
+
+        old_p = p + 1;
+        mean = strtod(c_row + old_p, &next_field);
+        if (next_field)
+          p = next_field - c_row;
+        else
+          p = row.size();
+
+        if (mean >= minCV) {
+          meanSum += mean;
+        }
+
+        bool checkMean = false, checkVar = false;
+        if (cvExt) { // abd file from 3rd party contains only mean coverage, so
+                     // assuming variance = mean
+          variance = mean;
+          checkMean = true;
+          if (isLarge) {
+            ABD(num - nskip, c) = mean;
+            ABD_VAR(num - nskip, c) = mean;
+          } else {
+            small_ABD(num1 - nskip1, c) = mean;
+          }
+        } else {
+          old_p = p + 1;
+          variance = strtod(c_row + old_p, &next_field);
+          if (next_field)
+            p = next_field - c_row;
+          else
+            p = row.size();
+
+          checkMean = true;
+          if (isLarge)
+            ABD(num - nskip, c / 2) = mean;
+          else
+            small_ABD(num1 - nskip1, c / 2) = mean;
+
+          checkVar = true;
+          if (isLarge)
+            ABD_VAR(num - nskip, c / 2) = variance;
+
+          ++c; // read two columns per iteration
+        }
+
+        if (checkMean) {
+          if (mean > 1e+7) {
+            cerr << "[Warning!] Need to check where the average depth is "
+                    "greater than 1e+7 for the contig "
+                 << label << ", column " << c + 1 << endl;
+            isGood = false;
+          }
+          if (mean < 0) {
+            cerr << "[Warning!] Negative coverage depth is not allowed for the "
+                    "contig "
+                 << label << ", column " << c + 1 << ": " << mean << endl;
+            isGood = false;
+          }
+        }
+
+        if (checkVar) {
+          if (variance > 1e+14) {
+            cerr << "[Warning!] Need to check where the depth variance is "
+                    "greater than 1e+14 for the contig "
+                 << label << ", column " << c + 1 << endl;
+            isGood = false;
+          }
+          if (variance < 0) {
+            cerr
+                << "[Warning!] Negative variance is not allowed for the contig "
+                << label << ", column " << c + 1 << ": " << variance << endl;
+            isGood = false;
+          }
+        }
+
+        if (!isGood)
+          break;
+      }
+
+      if (isGood && (int)nABD * (cvExt ? 1 : 2) != c) {
+        cerr << "[Warning!] Different number of variables for the object for "
+                "the contig "
+             << nABD << " != " << (cvExt ? c : c / 2) << " " << label << endl;
+        isGood = false;
+      }
+
+      if (meanSum < minCVSum) {
+        if (debug)
+          verbose_message("[Info] Ignored a contig (%s) having effective mean "
+                          "coverage %2.2f < %2.2f \n",
+                          label.c_str(), meanSum, minCVSum);
+        isGood = false;
+      }
+
+      if (isLarge) {
+        if (!isGood) {
+          ++nskip;
+          if (os) {
+            if (onlyLabel) {
+              *os << contig_names[num] << line_delim;
+            } else {
+              printFasta(*os, contig_names[num], seqs[num]);
+            }
+          }
+          contig_names[num] = "";
+          seqs[num] = "";
+        }
+        ++num;
+      } else if (isSmall) {
+        if (!isGood) {
+          ++nskip1;
+          if (os) {
+            if (onlyLabel) {
+              *os << small_contig_names[num1] << line_delim;
+            } else {
+              printFasta(*os, small_contig_names[num1], small_seqs[num1]);
+            }
+          }
+          small_contig_names[num1] = "";
+          small_seqs[num1] = "";
+        }
+        ++num1;
+      }
+    }
+    is.close();
+    if (os) {
+      os->close();
+      if (!*os) {
+        cerr << "[Error!] Failed to write to " << filteredFile_cls << endl;
+        return 1;
+      }
+      delete os;
+    }
+
+    assert(nobs == num && nobs1 == num1);
+
+    nobs = num - nskip;
+    nobs1 = num1 - nskip1;
+
+    assert(contigs.size() == nobs + nskip &&
+           small_contigs.size() == nobs1 + nskip1);
+
+    contigs.clear();
+    small_contigs.clear();
+
+    verbose_message("Finished reading %d contigs and %d coverages from %s "
+                    "[%.1fGb / %.1fGb]. Ignored %d too small contigs.     "
+                    "                                \n",
+                    r, nABD, abdFile.c_str(), getUsedPhysMem(),
+                    getTotalPhysMem() / 1024 / 1024, ignored_too_small);
+    if (debug) {
+      verbose_message("nobs = %d\n", nobs);
+      verbose_message("r = %d (num = %d), (nskip = %d) \n", r, num, nskip);
+    }
+    seqs.erase(std::remove(seqs.begin(), seqs.end(), ""), seqs.end());
+    assert(nobs == seqs.size());
+    small_seqs.erase(std::remove(small_seqs.begin(), small_seqs.end(), ""),
+                     small_seqs.end());
+    assert(nobs1 == small_seqs.size());
+    contig_names.erase(
+        std::remove(contig_names.begin(), contig_names.end(), ""),
+        contig_names.end());
+    assert(nobs == contig_names.size());
+    small_contig_names.erase(
+        std::remove(small_contig_names.begin(), small_contig_names.end(), ""),
+        small_contig_names.end());
+    assert(nobs1 == small_contig_names.size());
+    if (debug) {
+      verbose_message("seqs.size = %d, contig_names.size = %d\n", seqs.size(),
+                      contig_names.size());
+    }
+
+    if (ABD.size1() != nobs) {
+      ABD.resize(nobs, nABD, true);
+      ABD_VAR.resize(nobs, nABD, true);
+    }
+    if (small_ABD.size1() != nobs1) {
+      small_ABD.resize(nobs1, nABD, true);
+    }
+  }
+
+  verbose_message("Number of target contigs: %d of large (>= %d) and %d of "
+                  "small ones (>=%d & <%d). \n",
+                  nobs, minContig, nobs1, 1000, minContig);
+
+  if (nobs == 0) {
+    cerr << "[Error!] There were no large target contigs.  Cannot proceed.  Rerun with the '-d' option for more details." << endl;
+    return 1;
+  }
+  // prepare logsizes
+  logSizes.resize(nobs);
+#pragma omp parallel for
+  for (size_t r = 0; r < nobs; ++r) {
+    logSizes[r] = LOG10(std::min(seqs[r].size(), (size_t)500000));
+  }
+
+  verbose_message("Start contig TNF calculation. nobs = %zd\n", nobs);
+
+  TNF.resize(nobs, nTNF);
+  TNF.clear();
+  ProgressTracker progress(nobs);
+
+  verbose_message("Allocated memory for TNF [%.1fGb / %.1fGb]\n",
+                  getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(numThreads) proc_bind(spread)             \
+    schedule(dynamic)
+#else
+#endif
+  for (size_t r = 0; r < nobs; ++r) {
+    generateTNF(MatrixRowType(TNF, r), seqs[r]);
+
+    if (verbose) {
+      progress.track();
+      if (omp_get_thread_num() == 0 && progress.isStepMarker()) {
+        verbose_message("Calculating TNF %s\r", progress.getProgress());
+      }
+    }
+  }
+  verbose_message("Finished contig TNF calculation.  [%.1fGb / %.1fGb]         "
+                  "                       \n",
+                  getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+  // =========================================================================
+  // ASP PIPELINE INTERFACE: EXPORT DISTANCE PREDICATES AND EXIT
+  // 1. Default: Fall through to graph building and dump MetaBAT2 native composite
+  //    edge scores (g.sSCR) to composite_raw.lp.
+  // 2. All-pairs (legacy): Set env ASP_DUMP_RAW=1 to dump raw TNF and abundance
+  //    probabilities for all pairs (tnf_raw.lp, abd_raw.lp).
+  // 3. Selective pairs: Set env ASP_DUMP_PAIRS=<file> to evaluate distance
+  //    functions for a supplied list of pairs (comarker_raw.lp).
+  // Modes exit immediately after writing facts. Precedence: ASP_DUMP_RAW,
+  // ASP_DUMP_PAIRS, then the default composite dump.
+  // =========================================================================
+  if (getenv("ASP_DUMP_RAW")) {
+    verbose_message("Writing RAW ASP facts to tnf_raw.lp and abd_raw.lp...\n");
+    std::ofstream f_tnf("tnf_raw.lp");
+    std::ofstream f_abd("abd_raw.lp");
+
+    for (size_t i = 0; i < nobs; ++i) {
+      for (size_t j = i + 1; j < nobs; ++j) {
+        std::string id1 = contig_names[i];
+        std::string id2 = contig_names[j];
+
+        // 1. TNF Distance (Metabat2 logistic regression model)
+        double tnf_prob = cal_tnf_dist(i, j, TNF, TNF);
+        int tnf_int = (int)(tnf_prob * 100); // Scale probability to an integer 0-100
+
+        // 2. Abundance Distance (Overlapping Normal Distributions)
+        double abd_total = 0;
+        int valid_samples = 0;
+        for(size_t s = 0; s < nABD; ++s) {
+            bool nz = false;
+            double dist = cal_abd_dist(i, j, s, nz);
+            if(nz) { abd_total += dist; valid_samples++; }
+        }
+        double abd_prob = valid_samples > 0 ? (abd_total / valid_samples) : 1.0;
+        int abd_int = (int)(abd_prob * 100);
+
+        // Write with string IDs (we will map to ASP integers later)
+        f_tnf << "tnf(\"" << id1 << "\",\"" << id2 << "\"," << tnf_int << ").\n";
+        f_abd << "abd(\"" << id1 << "\",\"" << id2 << "\"," << abd_int << ").\n";
+      }
+    }
+    f_tnf.close();
+    f_abd.close();
+    verbose_message("Successfully wrote RAW ASP predicates. Exiting early!\n");
+    return 0; // Exit program!
+  }
+
+  // ==========================================
+  // ASP PAIR-LIST DUMP: MetaBAT2's cal_tnf_dist + cal_abd_dist evaluated on a
+  // supplied list of contig pairs, rather than all O(n^2) pairs.
+  //
+  // Contamination separation and merge guard checks require distances for pairs
+  // sharing single-copy marker genes. Because these pairs form an arbitrary sparse
+  // subset not fully covered by the TNF-pruned graph, this mode evaluates exact
+  // distances on demand in O(|P|) time, scaling efficiently to large assemblies.
+  //
+  // Usage:  ASP_DUMP_PAIRS=<pairs.tsv> metabat2 -i <fasta> -a <depth> -m 1500
+  //   pairs.tsv : whitespace-separated contig pairs per line.
+  //   output    : comarker_raw.lp, emitting comarker_sim("name1","name2",D).
+  //
+  // Distance D = tnf_int + abd_int, each scaled x100, yielding range 0..200
+  // (low D = high similarity). Unkept contigs are omitted and handled downstream.
+  // ==========================================
+  if (const char *asp_pairs_file = getenv("ASP_DUMP_PAIRS")) {
+    verbose_message("Reading ASP pair list from %s ...\n", asp_pairs_file);
+    std::ifstream f_pairs(asp_pairs_file);
+    if (!f_pairs) {
+      std::cerr << "[Error!] ASP_DUMP_PAIRS: cannot open " << asp_pairs_file
+                << std::endl;
+      return 1;
+    }
+
+    std::unordered_map<std::string, size_t> name2idx;
+    name2idx.reserve(nobs * 2);
+    for (size_t i = 0; i < nobs; ++i)
+      name2idx[contig_names[i]] = i;
+
+    std::ofstream f_cm("comarker_raw.lp");
+    f_cm << "% comarker_sim(C1,C2,D): MetaBAT2-NATIVE cal_tnf_dist + cal_abd_dist on a\n"
+            "% supplied pair list. D = tnf*100 + abd*100, range 0..200, low = similar.\n";
+
+    std::string n1, n2;
+    size_t nread = 0, nwrote = 0, nmiss = 0;
+    while (f_pairs >> n1 >> n2) {
+      ++nread;
+      std::unordered_map<std::string, size_t>::const_iterator it1 = name2idx.find(n1);
+      std::unordered_map<std::string, size_t>::const_iterator it2 = name2idx.find(n2);
+      if (it1 == name2idx.end() || it2 == name2idx.end()) {
+        ++nmiss;
+        continue;
+      }
+      size_t i = it1->second, j = it2->second;
+      if (i == j) {
+        ++nmiss;
+        continue;
+      }
+
+      // Identical arithmetic to ASP_DUMP_RAW above, on one pair instead of all.
+      double tnf_prob = cal_tnf_dist(i, j, TNF, TNF);
+      int tnf_int = (int)(tnf_prob * 100);
+
+      double abd_total = 0;
+      int valid_samples = 0;
+      for (size_t s = 0; s < nABD; ++s) {
+        bool nz = false;
+        double dist = cal_abd_dist(i, j, s, nz);
+        if (nz) {
+          abd_total += dist;
+          valid_samples++;
+        }
+      }
+      double abd_prob = valid_samples > 0 ? (abd_total / valid_samples) : 1.0;
+      int abd_int = (int)(abd_prob * 100);
+
+      f_cm << "comarker_sim(\"" << n1 << "\",\"" << n2 << "\","
+           << (tnf_int + abd_int) << ").\n";
+      ++nwrote;
+    }
+    f_cm.close();
+    verbose_message("Wrote %d comarker_sim facts to comarker_raw.lp (%d pairs read, "
+                    "%d skipped: contig not kept). Exiting early!\n",
+                    (int)nwrote, (int)nread, (int)nmiss);
+    return 0; // Exit program!
+  }
+
+  // Default path: continue into graph building, dump native composite below.
+  // ==========================================
+
+  ClassMap cls;
+  do {
+    std::vector<size_t> mems;
+    {
+      Graph g(nobs);
+
+      // 1. sampling graph to find minp
+      if (pTNF < 1.) {
+        if (nobs <= 25000) {
+          pTNF = gen_tnf_graph_sample(maxP, true);
+        } else {
+          for (size_t i = 0; i < 10; ++i) {
+            verbose_message("Attempt %d of 10 to gen_tnf_graph_sample\n", i);
+            Distance _minp = gen_tnf_graph_sample(maxP);
+            verbose_message("\n");
+            if (_minp < 701)
+              _minp = 700.;
+            pTNF += _minp;
+            if (i == 1 && pTNF / 2 < 701) {
+              pTNF = 700.;
+              break;
+            }
+            if (i == 9)
+              pTNF /= 10.;
+          }
+        }
+      } else {
+        pTNF *= 10;
+      }
+      verbose_message(
+          "Finished Preparing TNF Graph Building [pTNF = %2.2f] [%.1fGb / "
+          "%.1fGb]                                            \n",
+          pTNF / 10., getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+      // 2. build tnf graph
+      gen_tnf_graph(g, pTNF / 1000.);
+
+      if (recruitWithTNFMin == 0.0) {
+        // clean up
+        TNF.resize(0, 0, false);
+        verbose_message(
+            "Cleaned up TNF matrix of large contigs [%.1fGb / %.1fGb]  "
+            "                                           \n",
+            getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+      }
+
+      size_t nEdges = g.sTNF.size();
+
+      if (nEdges == 0) {
+        cout << "No edges were formed by TNF." << endl;
+        break;
+      }
+
+      // 3. convert sTNF to sSCR
+      if (!abdFile.empty()) {
+        verbose_message(
+            "Applying coverage correlations to TNF graph with %d edges\n",
+            nEdges);
+        g.sSCR.resize(nEdges, 0);
+        std::vector<StoredDistance> abd_distr(nEdges);
+        std::vector<uint16_t> nnz(nEdges, 0);
+        verbose_message("Allocated memory for graph edges [%.1fGb / %.1fGb]\n",
+                        getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+        ProgressTracker prog(nEdges);
+#pragma omp parallel for
+        for (size_t i = 0; i < nEdges; ++i) {
+          prog.track();
+          if (omp_get_thread_num() == 0 && prog.isStepMarker())
+            verbose_message(
+                "... calculating abundance dist %s                          \r",
+                prog.getProgress());
+          auto &g_sSCR = g.sSCR[i];
+          double val = g_sSCR;
+          for (size_t j = 0; j < nABD; ++j) {
+            bool nz = false;
+            double abd = 1. - cal_abd_dist(g.to[i], g.from[i], j, nz);
+            if (nz) {
+              val += abd;
+              ++nnz[i];
+            }
+          }
+
+          g_sSCR = val /= nnz[i];
+        }
+
+        std::partial_sort_copy(g.sSCR.begin(), g.sSCR.end(), abd_distr.begin(),
+                               abd_distr.end());
+
+        rank(g.sTNF, g.sTNF, "min");
+
+        std::vector<StoredDistance> sCOR;
+        if (nABD >= minSample) {
+          sCOR.resize(nEdges);
+          verbose_message("Calculating abundance corr [%.1fGb / %.1fGb]\n",
+                          getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+          ProgressTracker prog(nEdges);
+#pragma omp parallel for
+          for (size_t i = 0; i < nEdges; ++i) {
+            prog.track();
+            if (omp_get_thread_num() == 0 && prog.isStepMarker())
+              verbose_message("... calculating abundance corr %s               "
+                              "            \r",
+                              prog.getProgress());
+            size_t r1 = g.to[i], r2 = g.from[i];
+            sCOR[i] = cal_abd_corr(r1, r2);
+          }
+          rank(sCOR, sCOR, "max");
+        }
+
+        verbose_message("Calculating geometric means [%.1fGb / %.1fGb]\n",
+                        getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+#pragma omp parallel for
+        for (size_t i = 0; i < nEdges; ++i) {
+          g.sTNF[i] =
+              abd_distr[round(g.sTNF[i]) - 1]; // fit tnf to abd (consider abd
+                                               // as reference distribution)
+
+          if (nABD >= minSample)
+            sCOR[i] = abd_distr[round(sCOR[i]) - 1];
+
+          StoredDistance wTNF = 1. / (1 + nnz[i]);
+
+          if (nABD >= minSample)
+            g.sSCR[i] = POW(POW(g.sSCR[i], (StoredDistance)1. - wTNF) *
+                                POW(g.sTNF[i], wTNF) * sCOR[i],
+                            (StoredDistance)0.5); // geometric mean
+          else
+            g.sSCR[i] = POW(g.sSCR[i], (StoredDistance)1. - wTNF) *
+                        POW(g.sTNF[i], wTNF);
+        }
+      } else {
+        g.sSCR = g.sTNF;
+      }
+
+      // ==========================================
+      // ASP COMPOSITE DUMP: MetaBAT2's NATIVE pairwise edge score (g.sSCR) --
+      // the sparse, TNF-pruned neighbour graph it actually clusters on, combining
+      // TNF + abundance + abundance-correlation via the geometric mean above.
+      // Emitted as a SIMILARITY (higher = more similar). Integer scaling for ASP
+      // weak-constraint weights is done downstream in Python (range inspected there).
+      // Keeps MetaBAT2's native edge set (no top-k re-imposed).
+      // ==========================================
+      {
+        verbose_message("Writing ASP composite facts to composite_raw.lp (%d edges)...\n",
+                        (int)g.sSCR.size());
+        std::ofstream f_cmp("composite_raw.lp");
+        f_cmp << std::fixed;
+        f_cmp.precision(6);
+        for (size_t e = 0; e < g.sSCR.size(); ++e) {
+          f_cmp << "composite(\"" << contig_names[g.to[e]] << "\",\""
+                << contig_names[g.from[e]] << "\"," << g.sSCR[e] << ").\n";
+        }
+        f_cmp.close();
+        verbose_message("Successfully wrote composite ASP predicates. Exiting!\n");
+        return 0; // Exit program -- facts extracted, no clustering needed.
+      }
+      // ==========================================
+
+      std::vector<StoredDistance>().swap(g.sTNF);
+      ABD_VAR.clear();
+      ABD_VAR.resize(0, 0, false);
+
+      if (debug)
+      #pragma omp critical (COUT)
+        cout << *std::min_element(g.sSCR.begin(), g.sSCR.end()) << " : "
+             << *std::max_element(g.sSCR.begin(), g.sSCR.end()) << endl;
+
+      // 4. build sequential graph covering x % nodes and do clustering and add
+      // more edges and do clustering again
+      std::vector<size_t> oSCR;
+      orderhigh(g.sSCR, oSCR);
+
+      std::vector<size_t> node_order;
+
+      std::vector<Similarity> p_schedule2;
+      for (size_t i = 1; i <= 10; ++i)
+        p_schedule2.push_back(maxP / 10 * i);
+
+      mems.resize(nobs);
+      std::iota(mems.begin(), mems.end(), 0); // each is a singleton to start
+      verbose_message(
+          "Traversing graph with %d nodes and %d edges [%.1fGb / %.1fGb]\n",
+          nobs, nEdges, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+      Graph g2(nobs, true);
+      size_t which_p = 0;
+      ProgressTracker prog(nEdges);
+      for (size_t i = 0; i < nEdges; ++i) {
+        prog.track();
+        if (prog.isStepMarker())
+          verbose_message(
+              "... traversing graph %s                           \r",
+              prog.getProgress());
+
+        size_t ii = g.to[oSCR[i]], jj = g.from[oSCR[i]];
+
+        // 1. check if they are binned to the same cluster. if then skip
+        // generating additional edges.
+        if (mems[ii] !=
+            mems[jj]) { // || which_p < 5 allow all edges from first 5 schedule
+          if (g2.connected_nodes.find(ii) == g2.connected_nodes.end()) {
+            node_order.push_back(ii);
+            g2.connected_nodes.insert(ii);
+          }
+          if (g2.connected_nodes.find(jj) == g2.connected_nodes.end()) {
+            node_order.push_back(jj);
+            g2.connected_nodes.insert(jj);
+          }
+
+          Similarity scr = g.sSCR[oSCR[i]];
+          if (scr > minS) {
+            g2.sSCR.push_back(scr);
+            g2.from.push_back(jj);
+            g2.to.push_back(ii);
+            g2.incs[ii].push_back(g2.from.size() - 1);
+            g2.incs[jj].push_back(g2.from.size() - 1);
+          } else {
+            i = nEdges - 1; // early stopping
+          }
+        }
+
+        if (g2.getEdgeCount() > 0 &&
+            ((Similarity)g2.connected_nodes.size() / g2.n >=
+                 p_schedule2[which_p] ||
+             i == nEdges - 1)) {
+          verbose_message(
+              "Building SCR Graph and Binning (%d vertices and %d edges) [P = "
+              "%2.2f%%; %.1fGb / %.1fGb]                           \n",
+              g2.connected_nodes.size(), g2.getEdgeCount(),
+              p_schedule2[which_p] * 100, getUsedPhysMem(),
+              getTotalPhysMem() / 1024 / 1024);
+          label_propagation(g2, mems, node_order);
+
+          if (debug) {
+            std::string osfileName("cluster.log." +
+                                   boost::lexical_cast<std::string>(which_p));
+            std::ofstream os(osfileName);
+            if (!os) {
+              cerr << "[Error!] Failed to write to " << osfileName << endl;
+              return 1;
+            }
+            ClassMap _cls;
+            for (size_t i = 0; i < nobs; ++i) {
+              _cls[mems[i]].push_back(i);
+            }
+            for (size_t kk = 0; kk < nobs; ++kk) {
+              if (_cls[kk].size() > 1) {
+                os << kk << " : ";
+                ContigVector &vec = _cls[kk];
+                std::sort(vec.begin(), vec.end());
+                for (auto it2 = vec.begin(); it2 != vec.end(); ++it2) {
+                  os << *it2 << ",";
+                }
+                os << endl;
+              }
+            }
+            os.close();
+            if (!os) {
+              cerr << "[Error!] Failed to write to " << osfileName << endl;
+              return 1;
+            }
+          }
+
+          if (++which_p == p_schedule2.size())
+            break;
+        }
+      }
+    }
+    verbose_message("Finished Traversing graph [%.1fGb / %.1fGb]               "
+                    "                        \n",
+                    getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+    for (size_t i = 0; i < nobs; ++i) {
+      cls[mems[i]].push_back(i);
+    }
+
+    if (verbose) {
+      for (auto it = seqs.begin(); it != seqs.end(); ++it)
+        totalSize += it->size();
+      for (auto it = small_seqs.begin(); it != small_seqs.end(); ++it)
+        totalSize1 += it->size();
+    }
+
+    // dissolve all small bins and give them another chance to be binned with
+    // large ones.
+    std::vector<size_t> leftovers, toBeErased;
+    for (auto it = cls.begin(); it != cls.end(); ++it) {
+      size_t kk = it->first;
+
+      size_t s = 0;
+
+      for (auto it2 = cls[kk].begin(); it2 != cls[kk].end(); ++it2) {
+        s += seqs[*it2].size();
+      }
+
+      if (s < minClsSize) {
+        leftovers.insert(leftovers.end(), cls[kk].begin(), cls[kk].end());
+        std::vector<size_t>().swap(cls[kk]);
+        toBeErased.push_back(kk);
+      }
+    }
+    verbose_message("Dissolved %d small clusters leaving %d leftover contigs "
+                    "to be re-merged into larger clusters\n",
+                    leftovers.size(), toBeErased.size());
+    for (auto x : toBeErased)
+      cls.erase(x);
+
+    leftovers.shrink_to_fit();
+    std::vector<size_t>().swap(toBeErased);
+
+    // additional binning with small contigs and leftovers
+    if (!noAdd && nABD >= minSample && (leftovers.size() > 0 || nobs1 > 0)) {
+
+      Matrix spearman;
+      spearman.resize(ABD.size1(), ABD.size2());
+      spearman.clear();
+
+      std::vector<std::vector<StoredDistance>> threadRowMat(numThreads);
+#pragma omp parallel for schedule(static, 1)
+      for (auto t = 0; t < numThreads; t++)
+        threadRowMat[omp_get_thread_num()].resize(ABD.size2());
+
+#pragma omp parallel for schedule(dynamic, 1)
+      for (size_t r = 0; r < ABD.size1(); ++r) {
+        auto &rowMat = threadRowMat[omp_get_thread_num()];
+        const MatrixRowType rRow(ABD, r);
+        std::copy(rRow.begin(), rRow.end(), rowMat.begin());
+        rank(rowMat, rowMat);
+        MatrixRowType sRow(spearman, r);
+        std::copy(rowMat.begin(), rowMat.end(), sRow.begin());
+      }
+      verbose_message(
+          "Calculated %d spearman corr for small and leftover contigs\n",
+          ABD.size1());
+      assert(spearman.size1() == nobs);
+      assert(spearman.size2() == nABD);
+
+      std::unordered_map<size_t, size_t> cls_id_to_idx;
+      std::vector<size_t> clsIds;
+      if (recruitWithTNFMin > 0.0 || recruitToAbdCentroid) {
+        auto sz = cls.size();
+        cls_id_to_idx.reserve(sz);
+        clsIds.reserve(sz);
+        int idx = 0;
+        for (auto &[clsId, contigIds] : cls) {
+          verbose_message("cluster %d is # %d with %d contigs\n", clsId, idx,
+                          contigIds.size());
+          cls_id_to_idx[clsId] = idx++;
+          clsIds.push_back(clsId);
+        }
+        assert(idx == sz);
+      }
+      if (recruitToAbdCentroid) {
+        ABD_centroids.resize(cls.size(), nABD, false);
+        verbose_message("Calculating centroid abundances of existing %d bins "
+                        "[%.1fGb / %.1fGb]\n",
+                        cls.size(), getUsedPhysMem(),
+                        getTotalPhysMem() / 1024 / 1024);
+        for (auto &[clsId, contigIds] : cls) {
+          std::vector<double> tmp_centroid(nABD, 0.0);
+          for (auto contigId : contigIds) {
+            for (auto idx = 0; idx < nABD; idx++) {
+              tmp_centroid[idx] += spearman(contigId, idx);
+            }
+          }
+          for (auto idx = 0; idx < nABD; idx++) {
+            ABD_centroids(cls_id_to_idx[clsId], idx) = tmp_centroid[idx];
+          }
+        }
+      }
+
+      if (recruitWithTNFMin > 0.0) {
+        auto sz = cls.size();
+        TNF_centroids.resize(sz, nTNF);
+        verbose_message("Calculating centroid TNFs of existing %d bins "
+                        "[%.1fGb / %.1fGb]\n",
+                        sz, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+        assert(sz == clsIds.size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (auto idx = 0; idx < sz; idx++) {
+          auto &clsId = clsIds[idx];
+          auto &contigIds = cls[clsId];
+          std::vector<string> cls_seqs;
+          cls_seqs.reserve(contigIds.size());
+          for (auto contigId : contigIds) {
+            cls_seqs.push_back(seqs[contigId]);
+          }
+          generateTNF(MatrixRowType(TNF_centroids, idx), seqs);
+        }
+      }
+
+      unsigned long long binned_size = 0;
+      for (auto it = cls.begin(); it != cls.end(); ++it) {
+        size_t kk = it->first;
+        for (auto it2 = cls[kk].begin(); it2 != cls[kk].end(); ++it2) {
+          binned_size += seqs[*it2].size();
+        }
+      }
+
+      verbose_message("Calculating mean corr within the %d bins which have >= "
+                      "minCS(%d) contigs...          \n",
+                      cls.size(), minCS);
+      // 1. calculate mean corr within bins
+      // 2. cal mean corr from a contig to  a bin greater than mean and assign
+      // it to the best bin over the threshold
+      std::unordered_map<size_t, StoredDistance> cls_corr;
+      std::vector<ClassMap::iterator> largeClusters;
+      ProgressTracker prog_cls(cls.size());
+#pragma omp parallel
+#pragma omp single
+      for (auto it = cls.begin(); it != cls.end(); ++it) {
+        prog_cls.track();
+        if (prog_cls.isStepMarker()) {
+          verbose_message("... %s [%.1fGb / %.1fGb]\r", prog_cls.getProgress(),
+                          getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+        }
+        size_t kk = it->first;
+        size_t cs = it->second.size();
+        if (cs >= 250) {
+#pragma omp critical(APPEND_LARGE_CLS)
+          largeClusters.push_back(it);
+        } else if (cs >= minCS) {
+#pragma omp task
+          {
+            double corr = 0.;
+            const auto &c = it->second;
+            for (size_t i = 0; i < cs; ++i) {
+              for (size_t j = i + 1; j < cs; ++j) {
+                corr += cal_abd_corr(c[i], c[j]);
+              }
+            }
+
+            StoredDistance x = corr / (cs * (cs - 1) / 2);
+#pragma omp critical(CALC_MEAN_CORR)
+            cls_corr[kk] = x;
+          }
+        }
+      }
+
+      if (largeClusters.size() > 0) {
+        size_t maxSize = 0, totalSize = 0, totalCalcs;
+
+        for (auto it : largeClusters) {
+          size_t kk = it->first;
+          size_t cs = it->second.size();
+          if (cs > maxSize)
+            maxSize = cs;
+          totalSize += cs;
+          totalCalcs += cs * (cs - 1) / 2;
+        }
+
+        verbose_message("Processing %d large clusters. maxSize=%d avgSize=%f "
+                        "totalCalcs=%d\n",
+                        largeClusters.size(), maxSize,
+                        (double)totalSize / largeClusters.size(), totalCalcs);
+        ProgressTracker prog_lg(totalCalcs);
+        for (auto it : largeClusters) {
+          size_t kk = it->first;
+          size_t cs = it->second.size();
+          double corr = 0.;
+          const auto &c = it->second;
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : corr)
+          for (size_t i = 0; i < cs; ++i) {
+            for (size_t j = i + 1; j < cs; ++j) {
+              corr += cal_abd_corr(c[i], c[j]);
+            }
+            prog_lg.track(cs - i);
+            if (omp_get_thread_num() == 0 && prog_lg.isStepMarker()) {
+              verbose_message(".... %s\r", prog_lg.getProgress());
+            }
+          }
+
+          StoredDistance x = corr / (cs * (cs - 1) / 2);
+          cls_corr[kk] = x;
+        }
+        verbose_message(
+            "Done with large cluster corr calcs                 \n");
+      }
+      verbose_message(
+          "Binning lost contigs over %d leftovers and %d bins...          \n",
+          leftovers.size(), cls.size());
+      ProgressTracker lost_progress = ProgressTracker(leftovers.size());
+      ClassMap cls_leftovers;
+
+      const double TNF_recruit_cutoff = pTNF * recruitWithTNFMin / 1000.;
+#pragma omp parallel for schedule(dynamic, 1)
+      for (size_t l = 0; l < leftovers.size(); ++l) {
+        lost_progress.track();
+        if (verbose && omp_get_thread_num() == 0 &&
+            lost_progress.isStepMarker())
+          verbose_message("Finding lost contigs %s\r",
+                          lost_progress.getProgress());
+        int best_cls = -1;
+        for (auto it = cls.begin(); it != cls.end(); ++it) {
+          size_t kk = it->first;
+          const auto &c = it->second;
+          size_t cs = c.size();
+          if (cs >= minCS) {
+            double corr = 0;
+            if (recruitWithTNFMin > 0.0) {
+              auto cls_idx = cls_id_to_idx[kk];
+              auto sTNF =
+                  1. - cal_tnf_dist(cls_idx, leftovers[l], TNF_centroids, TNF);
+              if (sTNF < TNF_recruit_cutoff)
+                continue;
+            }
+            if (recruitToAbdCentroid) {
+              auto cls_idx = cls_id_to_idx[kk];
+              corr = cal_abd_corr(cls_idx, leftovers[l], false, true);
+            } else {
+              size_t i = 0;
+
+              // subset
+              for (; i < minCS; ++i)
+                corr += cal_abd_corr(c[i], leftovers[l]);
+
+              // early stop
+              if (corr / minCS < cls_corr[kk])
+                continue;
+
+              for (; i < cs; ++i)
+                corr += cal_abd_corr(c[i], leftovers[l]);
+
+              corr /= cs;
+            }
+            if (corr >= cls_corr[kk]) {
+              if (best_cls > -1) { // only allow unique assignment.
+                best_cls = -1;
+                break;
+              }
+              best_cls = kk;
+            }
+          }
+        }
+        if (best_cls > -1) {
+#pragma omp critical(ADD_LEFTOVER_CONTIGS)
+          cls_leftovers[best_cls].push_back(leftovers[l]);
+        }
+      }
+      if (recruitWithTNFMin > 0.0) {
+        TNF.resize(0, 0, false);
+        verbose_message(
+            "Cleaned up TNF matrix of large contigs [%.1fGb / %.1fGb]     "
+            "                                        \n",
+            getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+      }
+
+      ClassMap cls_small;
+      if (nobs1 > 0) {
+        verbose_message("Binning %d small contigs...                           "
+                        "              \n",
+                        nobs1);
+        assert(small_ABD.size1() == nobs1);
+        assert(small_ABD.size2() == nABD);
+
+// Spearman corr
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t r = 0; r < small_ABD.size1(); ++r) {
+          auto &rowMat = threadRowMat[omp_get_thread_num()];
+          MatrixRowType rRow(small_ABD, r);
+          std::copy(rRow.begin(), rRow.end(), rowMat.begin());
+          rank(rowMat, rowMat);
+          std::copy(rowMat.begin(), rowMat.end(), rRow.begin());
+        }
+        verbose_message("Finished %d spearman corr calcs\n", small_ABD.size1());
+        threadRowMat.clear();
+
+        ProgressTracker small_progress(nobs1);
+#pragma omp parallel for schedule(dynamic)
+        for (size_t s = 0; s < nobs1; ++s) {
+          small_progress.track();
+          if (verbose && omp_get_thread_num() == 0 &&
+              small_progress.isStepMarker())
+            verbose_message("Binning small contigs %s\r",
+                            small_progress.getProgress());
+
+          int best_cls = -1;
+          for (auto it = cls.begin(); it != cls.end(); ++it) {
+            size_t kk = it->first;
+            const auto &c = it->second;
+            size_t cs = c.size();
+            if (cs >= minCS) {
+              double corr = 0;
+              if (recruitToAbdCentroid) {
+                auto cls_idx = cls_id_to_idx[kk];
+                corr = cal_abd_corr(cls_idx, s, true, true);
+              } else {
+                size_t i = 0;
+                // subset
+                for (; i < minCS; ++i)
+                  corr += cal_abd_corr(c[i], s, true);
+
+                // early stop
+                if (corr / minCS < cls_corr[kk])
+                  continue;
+
+                for (; i < cs; ++i)
+                  corr += cal_abd_corr(c[i], s, true);
+
+                corr /= cs;
+              }
+              if (corr >= cls_corr[kk]) {
+                if (best_cls > -1) { // only allow unique assignment.
+                  best_cls = -1;
+                  break;
+                }
+                if (TNF_recruit_cutoff > 0.0) {
+                  auto cls_idx = cls_id_to_idx[kk];
+                  Matrix small_tnf(1, nTNF);
+                  generateTNF(MatrixRowType(small_tnf, 0), small_seqs[s]);
+                  auto sTNF =
+                      1. - cal_tnf_dist(cls_idx, 0, TNF_centroids, small_tnf);
+                  if (sTNF < TNF_recruit_cutoff)
+                    continue;
+                }
+                best_cls = kk;
+              }
+            }
+          }
+          if (best_cls > -1 && recruitWithTNFMin > 0.0) {
+            auto tnf_cutoff = pTNF * recruitWithTNFMin;
+          }
+          if (best_cls > -1) {
+#pragma omp critical(ADD_SMALL_CONTIGS)
+            cls_small[best_cls].push_back(s + nobs);
+          }
+        }
+      }
+
+      unsigned long long added_sum = 0;
+      for (auto it = cls_leftovers.begin(); it != cls_leftovers.end(); ++it) {
+        size_t kk = it->first;
+        for (auto it2 = cls_leftovers[kk].begin();
+             it2 != cls_leftovers[kk].end(); ++it2) {
+          added_sum += seqs[*it2].size();
+        }
+      }
+
+      if (added_sum > 0) {
+        Distance fraction = (Distance)added_sum / binned_size;
+        if (fraction < .10) { // allow only at most 10% recruiting
+          for (auto it = cls_leftovers.begin(); it != cls_leftovers.end();
+               ++it) {
+            size_t kk = it->first;
+            cls[kk].insert(cls[kk].end(), cls_leftovers[kk].begin(),
+                           cls_leftovers[kk].end());
+          }
+          verbose_message("%2.2f%% (%lld bases) of large (>=%d) contigs were "
+                          "re-binned out of small bins (<%d).\n",
+                          fraction * 100, added_sum, minContig, minClsSize);
+        } else {
+          verbose_message("[Info] Additional binning of lost contigs was "
+                          "ignored since it was too excessive [%2.2f%% (%lld "
+                          "bases) of large (>=%d) contigs is > %2.0f%%].\n",
+                          fraction * 100, added_sum, minContig, .10 * 100);
+        }
+      }
+
+      added_sum = 0;
+      for (auto it = cls_small.begin(); it != cls_small.end(); ++it) {
+        size_t kk = it->first;
+        for (auto it2 = cls_small[kk].begin(); it2 != cls_small[kk].end();
+             ++it2) {
+          auto idx = *it2 - nobs;
+          added_sum += small_seqs[idx].size();
+        }
+      }
+
+      if (added_sum > 0) {
+        Distance fraction = (Distance)added_sum / totalSize1;
+        if (fraction < .15) { // allow only at most 15% recruiting
+          for (auto it = cls_small.begin(); it != cls_small.end(); ++it) {
+            size_t kk = it->first;
+            cls[kk].insert(cls[kk].end(), cls_small[kk].begin(),
+                           cls_small[kk].end());
+          }
+        } else {
+          verbose_message("[Info] Additional binning of small contigs was "
+                          "ignored since it was too excessive [%2.2f%% (%lld "
+                          "bases) of small (<%d) contigs is > %2.0f%%].\n",
+                          fraction * 100, added_sum, minContig, .10 * 100);
+        }
+      }
+    }
+
+  } while (false);
+
+  verbose_message("Rescuing singleton large contigs                          "
+                  "         \n");
+  rescue_singletons(cls);
+
+  verbose_message("Outputting bins\n");
+  output_bins(cls);
+
+  verbose_message("Finished\n");
+  return 0;
+}
+
+void generateTNF(MatrixRowType tnf, const std::vector<string> &seqs) {
+  for (const auto &s : seqs) {
+    char tn[5] = {'\0'};
+    const char *seq = s.c_str();
+
+    for (size_t i = 0; i < s.length() - 3; ++i) {
+      int tnNum = tnToNumber(seq + i);
+      int tnIdx = TNLookup[tnNum];
+
+      if (tnIdx < nTNF) {
+        ++tnf(tnIdx);
+      }
+    }
+  }
+
+  // normalize to unit size (L2 norm)
+  double rsum = 0;
+  for (size_t c = 0; c < tnf.size(); ++c) {
+    auto t = tnf(c);
+    rsum += t * t;
+  }
+  rsum = SQRT(rsum);
+  for (size_t c = 0; c < tnf.size(); ++c) {
+    tnf(c) /= rsum;
+  }
+}
+void generateTNF(MatrixRowType tnf, const string &seq) {
+  std::vector<string> seqs;
+  seqs.push_back(seq);
+  generateTNF(tnf, seqs);
+}
+
+// for normal distributions
+Distance cal_abd_dist2(Normal &p1, Normal &p2) {
+  Distance k1, k2, tmp, d = 0;
+
+  Distance m1 = p1.mean();
+  Distance m2 = p2.mean();
+  Distance v1 = p1.standard_deviation();
+  v1 = v1 * v1;
+  Distance v2 = p2.standard_deviation();
+  v2 = v2 * v2;
+
+  // normal_distribution
+  auto v1minusv2 = v1 - v2;
+  if (FABS(v1minusv2) < 1e-4) {
+    k1 = k2 = (m1 + m2) / 2;
+  } else {
+    auto m1minusm2 = m1 - m2;
+    auto m1timesv2 = m1 * v2;
+    auto m2timesv1 = m2 * v1;
+    tmp = SQRT(v1 * v2 *
+               ((m1minusm2) * (m1minusm2)-2 * (v1minusv2)*LOG(SQRT(v2 / v1))));
+    k1 = (tmp - m1timesv2 + m2timesv1) / (v1minusv2);
+    k2 = (tmp + m1timesv2 - m2timesv1) / (-v1minusv2);
+  }
+
+  if (k1 > k2) {
+    tmp = k1;
+    k1 = k2;
+    k2 = tmp;
+  }
+  if (v1 > v2) {
+    std::swap(p1, p2);
+  }
+
+  if (k1 == k2)
+    d = (FABS(boost::math::cdf(p1, k1) - boost::math::cdf(p2, k1)));
+  else
+    d = (FABS(boost::math::cdf(p1, k2) - boost::math::cdf(p1, k1) +
+              boost::math::cdf(p2, k1) - boost::math::cdf(p2, k2)));
+
+  return d;
+}
+
+double cal_abd_dist(size_t r1, size_t r2, size_t i, bool &nz) {
+  double d = 0;
+  StoredDistance m1 = ABD(r1, i);
+  StoredDistance m2 = ABD(r2, i);
+  if (m1 > minCV || m2 > minCV) {
+    nz = true;
+    m1 = std::max(m1, (StoredDistance)1e-6);
+    m2 = std::max(m2, (StoredDistance)1e-6);
+    if (m1 != m2) {
+      StoredDistance &var1i = ABD_VAR(r1, i);
+      StoredDistance &var2i = ABD_VAR(r2, i);
+      StoredDistance v1 = var1i < 1 ? 1 : var1i;
+      StoredDistance v2 = var2i < 1 ? 1 : var2i;
+
+      Normal p1(m1, SQRT(v1)), p2(m2, SQRT(v2));
+      d = cal_abd_dist2(p1, p2);
+    }
+  }
+  return std::min(std::max(d, (double)1e-6), (double)(1. - 1e-6));
+}
+
+template <typename D>
+double _cal_tnf_dist(size_t r1, size_t r2, const Matrix &TNF1,
+                     const Matrix &TNF2) {
+  // EXP(preProb) <= 9 yields prob >= 0.1, so preProb <= LOG(9.0);
+  const D floor_prob = 0.1;
+  const D floor_preProb = LOG((1.0 / floor_prob) - 1.0);
+
+  double d = 0;
+
+  for (size_t i = 0; i < nTNF; ++i) {
+    D diff = TNF1(r1, i) - TNF2(r2, i);
+    d += diff * diff; // euclidean distance
+  }
+
+  d = SQRT(d);
+
+  D b, c; // parameters
+
+  const auto &ctg1 = logSizes[r1];
+  const auto &ctg2 = logSizes[r2];
+
+  const auto &lw11 = std::min(ctg1, ctg2);
+  const auto &lw21 = std::max(ctg1, ctg2);
+  D lw12 = lw11 * lw11;
+  D lw13 = lw12 * lw11;
+  D lw14 = lw13 * lw11;
+  D lw15 = lw14 * lw11;
+  D lw16 = lw15 * lw11;
+  D lw17 = lw16 * lw11;
+  D lw22 = lw21 * lw21;
+  D lw23 = lw22 * lw21;
+  D lw24 = lw23 * lw21;
+  D lw25 = lw24 * lw21;
+  D lw26 = lw25 * lw21;
+
+  double prob;
+
+  b = (D)46349.1624324381 + (D)-76092.3748553155 * lw11 +
+      (D)-639.918334183 * lw21 + (D)53873.3933743949 * lw12 +
+      (D)-156.6547554844 * lw22 + (D)-21263.6010657275 * lw13 +
+      (D)64.7719132839 * lw23 + (D)5003.2646455284 * lw14 +
+      (D)-8.5014386744 * lw24 + (D)-700.5825500292 * lw15 +
+      (D)0.3968284526 * lw25 + (D)54.037542743 * lw16 +
+      (D)-1.7713972342 * lw17 + (D)474.0850141891 * lw11 * lw21 +
+      (D)-23.966597785 * lw12 * lw22 + (D)0.7800219061 * lw13 * lw23 +
+      (D)-0.0138723693 * lw14 * lw24 + (D)0.0001027543 * lw15 * lw25;
+  c = (D)-443565.465710869 + (D)718862.10804858 * lw11 +
+      (D)5114.1630934534 * lw21 + (D)-501588.206183097 * lw12 +
+      (D)784.4442123743 * lw22 + (D)194712.394138513 * lw13 +
+      (D)-377.9645994741 * lw23 + (D)-45088.7863182741 * lw14 +
+      (D)50.5960513287 * lw24 + (D)6220.3310639927 * lw15 +
+      (D)-2.3670776453 * lw25 + (D)-473.269785487 * lw16 +
+      (D)15.3213264134 * lw17 + (D)-3282.8510348085 * lw11 * lw21 +
+      (D)164.0438603974 * lw12 * lw22 + (D)-5.2778800755 * lw13 * lw23 +
+      (D)0.0929379305 * lw14 * lw24 + (D)-0.0006826817 * lw15 * lw25;
+
+  // logistic model
+  //  prob = 1.0 / (1 + EXP(-(b + c * d)));
+  //  if (prob >= .1)  //second logistic model
+  double preProb = -(b + c * d);
+  // preProb <= LOG(9.0) yields prob > 0.1, so use second logistic model
+  prob = preProb <= floor_preProb ? floor_prob : 1.0 / (1 + EXP(preProb));
+
+  if (prob >= floor_prob) { // second logistic model
+    b = (D)6770.9351457442 + (D)-5933.7589419767 * lw11 +
+        (D)-2976.2879986855 * lw21 + (D)3279.7524685865 * lw12 +
+        (D)1602.7544794819 * lw22 + (D)-967.2906583423 * lw13 +
+        (D)-462.0149190219 * lw23 + (D)159.8317289682 * lw14 +
+        (D)74.4884405822 * lw24 + (D)-14.0267151808 * lw15 +
+        (D)-6.3644917671 * lw25 + (D)0.5108811613 * lw16 +
+        (D)0.2252455343 * lw26 + (D)0.965040193 * lw12 * lw22 +
+        (D)-0.0546309127 * lw13 * lw23 + (D)0.0012917084 * lw14 * lw24 +
+        (D)-1.14383e-05 * lw15 * lw25;
+    c = (D)39406.5712626297 + (D)-77863.1741143294 * lw11 +
+        (D)9586.8761567725 * lw21 + (D)55360.1701572325 * lw12 +
+        (D)-5825.2491611377 * lw22 + (D)-21887.8400068324 * lw13 +
+        (D)1751.6803621934 * lw23 + (D)5158.3764225203 * lw14 +
+        (D)-290.1765894829 * lw24 + (D)-724.0348081819 * lw15 +
+        (D)25.364646181 * lw25 + (D)56.0522105105 * lw16 +
+        (D)-0.9172073892 * lw26 + (D)-1.8470088417 * lw17 +
+        (D)449.4660736502 * lw11 * lw21 + (D)-24.4141920625 * lw12 * lw22 +
+        (D)0.8465834103 * lw13 * lw23 + (D)-0.0158943762 * lw14 * lw24 +
+        (D)0.0001235384 * lw15 * lw25;
+    // prob = 1.0 / (1 + EXP(-(b + c * d)));
+    //  prob = prob < .1 ? .1 : prob;
+    preProb = -(b + c * d); // EXP(preProb) <= 9 yields prob >= 0.1, so preProb
+                            // <= LOG(9.0) to calculate, otherwise use the floor
+    prob = preProb <= floor_preProb ? 1.0 / (1 + EXP(preProb)) : floor_prob;
+  }
+
+  return prob;
+}
+double cal_tnf_dist(size_t r1, size_t r2, const Matrix &TNF1,
+                    const Matrix &TNF2) {
+  return _cal_tnf_dist<CALC_TYPE>(r1, r2, TNF1, TNF2);
+}
+
+size_t ncols(std::ifstream &is, int skip = 0) {
+  size_t nc = 0;
+
+  std::string firstLine;
+  while (skip-- >= 0)
+    std::getline(is, firstLine);
+
+  std::stringstream ss(firstLine);
+  std::string col;
+  while (std::getline(ss, col, tab_delim)) {
+    ++nc;
+  }
+
+  return nc;
+}
+
+size_t ncols(const char *f, int skip = 0) {
+  std::ifstream is(f);
+  if (!is.is_open()) {
+    cerr << "[Error!] can't open input file " << f << endl;
+    return 0;
+  }
+
+  return ncols(is, skip);
+}
+
+// refer to
+// http://stackoverflow.com/questions/6089231/getting-std-ifstream-to-handle-lf-cr-and-crlf
+std::istream &safeGetline(std::istream &is, std::string &t) {
+  static int max_line = 1024;
+  t.clear();
+  t.reserve(max_line);
+
+  // The characters in the stream are read one-by-one using a std::streambuf.
+  // That is faster than reading them one-by-one using the std::istream.
+  // Code that uses streambuf this way must be guarded by a sentry object.
+  // The sentry object performs various tasks,
+  // such as thread synchronization and updating the stream state.
+
+  std::istream::sentry se(is, true);
+  std::streambuf *sb = is.rdbuf();
+
+  for (;;) {
+    int c = sb->sbumpc();
+    switch (c) {
+    case '\n':
+      return is;
+    case '\r':
+      if (sb->sgetc() == '\n')
+        sb->sbumpc();
+      return is;
+    case EOF:
+      // Also handle the case when the last line has no line ending
+      if (t.empty())
+        is.setstate(std::ios::eofbit);
+      return is;
+    default:
+      t += (char)c;
+    }
+  }
+  if (max_line < t.size())
+    max_line = t.size() * 1.05 + 32;
+  return is;
+}
+
+bool is_nz(size_t r1, size_t r2) {
+  if (abdFile.empty())
+    return true;
+
+  for (size_t i = 0; i < nABD; ++i) {
+    const auto &m1 = ABD(r1, i);
+    const auto &m2 = ABD(r2, i);
+    if (m1 > minCV || m2 > minCV) { // compare only at least one > minimum
+      return true;
+    }
+  }
+  return false;
+}
+
+#pragma omp declare reduction (merge_size_t : std::vector<size_t> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
+#pragma omp declare reduction (merge_dist : std::vector<Distance> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
+#pragma omp declare reduction (merge_storeddist : std::vector<StoredDistance> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
+
+void gen_tnf_graph(Graph &g, Similarity cutoff) {
+
+  ProgressTracker progress = ProgressTracker(nobs);
+
+  std::vector<size_t> &from = g.from;
+  std::vector<size_t> &to = g.to;
+  auto &sTNF = g.sTNF;
+
+  size_t TILE = 10;
+  try {
+    TILE = std::max((size_t)((CacheSize() * 1024.) /
+                             (2 * sizeof(StoredDistance) * nTNF +
+                              maxEdges * (2 * sizeof(size_t) +
+                                          1 * sizeof(StoredDistance)))),
+                    (size_t)10);
+  } catch (...) {
+  }
+  verbose_message("Starting Building TNF Graph. CacheSize=%d TILE=%d nobs=%d "
+                  "maxEdges=%d\n",
+                  CacheSize(), TILE, nobs, maxEdges);
+
+#pragma omp parallel for schedule(dynamic, 1) reduction(merge_size_t           \
+                                                        : from)                \
+    reduction(merge_size_t                                                     \
+              : to) reduction(merge_storeddist                                 \
+                              : sTNF)
+  for (size_t ii = 0; ii < nobs; ii += TILE) {
+    std::vector<std::priority_queue<Edge, std::vector<Edge>, CompareEdge>>
+        tmp_iedges(TILE);
+    auto i_stop = std::min(ii + TILE, nobs);
+
+    for (size_t jj = 0; jj < nobs; jj += TILE) {
+      auto j_stop = std::min(jj + TILE, nobs);
+
+      for (size_t i = ii; i < i_stop; ++i) {
+        size_t que_index = i - ii;
+        auto &edges = tmp_iedges[que_index];
+
+        for (size_t j = jj; j < j_stop; ++j) {
+          if (i == j || !is_nz(i, j))
+            continue;
+          StoredDistance sTNF = 1. - cal_tnf_dist(i, j);
+          if (sTNF > cutoff &&
+              (edges.size() < maxEdges ||
+               (edges.size() == maxEdges && sTNF > edges.top().second))) {
+            if (edges.size() == maxEdges)
+              edges.pop();
+            edges.push(std::make_pair(j, sTNF));
+          }
+        }
+      }
+    }
+    for (size_t k = 0; k < TILE; ++k) {
+      auto &edges = tmp_iedges[k];
+      auto i_idx = ii + k;
+      if (i_idx > i_stop)
+        break;
+      while (!edges.empty()) {
+        Edge edge = edges.top();
+        if (i_idx < edge.first) {
+          sTNF.push_back(edge.second);
+          from.push_back(i_idx);
+          to.push_back(edge.first);
+        }
+        edges.pop();
+      }
+    }
+
+    if (verbose) {
+      progress.track(TILE);
+      if (omp_get_thread_num() == 0 && progress.isStepMarker()) {
+        verbose_message("Building TNF Graph %s [%.1fGb / %.1fGb]               "
+                        "            \r",
+                        progress.getProgress(), getUsedPhysMem(),
+                        getTotalPhysMem() / 1024 / 1024);
+      }
+    }
+  }
+
+  verbose_message("Finished Building TNF Graph (%d edges) [%.1fGb / %.1fGb]    "
+                  "                                      \n",
+                  g.getEdgeCount(), getUsedPhysMem(),
+                  getTotalPhysMem() / 1024 / 1024);
+
+  g.sTNF.shrink_to_fit();
+  g.to.shrink_to_fit();
+  g.from.shrink_to_fit();
+
+  verbose_message("Cleaned up after Building TNF Graph (%d edges) [%.1fGb / "
+                  "%.1fGb]                                          \n",
+                  g.getEdgeCount(), getUsedPhysMem(),
+                  getTotalPhysMem() / 1024 / 1024);
+}
+
+size_t gen_tnf_graph_sample(Distance coverage, bool full) {
+
+  size_t _nobs = full ? nobs : std::min(nobs, (size_t)2500);
+
+  // cuckoohash_map<int, bool> connected_nodes;
+  std::vector<unsigned char> connected_nodes;
+  connected_nodes.resize(_nobs);
+
+  std::vector<size_t> idx(nobs);
+  std::iota(idx.begin(), idx.end(), 0);
+  random_unique(idx.begin(), idx.end(), _nobs);
+
+  ProgressTracker prog(nobs);
+  Similarity *matrix = (Similarity *)malloc(_nobs * nobs * sizeof(Similarity));
+#pragma omp parallel for
+  for (size_t j = 0; j < nobs; ++j) {
+    prog.track();
+    if (omp_get_thread_num() == 0 && prog.isStepMarker())
+      verbose_message("... processing TNF matrix %s               \r",
+                      prog.getProgress());
+    for (size_t i = 0; i < _nobs; ++i) {
+      Similarity s =
+          1. -
+          cal_tnf_dist(
+              idx[i],
+              idx[j]); // similarity scores from the virtually shuffled matrix
+      matrix[i * nobs + j] = s;
+    }
+  }
+
+  size_t p = 999, pp = 1000;
+  Distance cov = 0, pcov = 0;
+  int round = 0;
+
+  for (; p > 700;) {
+    round++;
+
+    Distance cutoff = (Distance)p / 1000.;
+    ProgressTracker prog2(_nobs);
+    verbose_message("Finding cutoff p=%d [%.1fGb / %.1fGb]                     "
+                    "                                \r",
+                    p, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+
+#pragma omp parallel for
+    for (size_t i = 0; i < _nobs; ++i) {
+      prog2.track();
+      if (omp_get_thread_num() == 0 && prog2.isStepMarker())
+        verbose_message(
+            "... finding cutoff p=%d %s                          \r", p,
+            prog2.getProgress());
+      size_t kk = nobs;
+      if (connected_nodes[i])
+        kk = _nobs;
+      for (size_t j = i + 1; j < kk; ++j) {
+        auto &s = matrix[i * nobs + j];
+        if (s >= cutoff) {
+          connected_nodes[i] = 1;
+          if (j < _nobs) {
+            connected_nodes[j] = 1;
+          }
+        }
+      }
+    }
+
+    // cov = (Distance) connected_nodes.size() / _nobs;
+    int counton = 0;
+#pragma omp parallel for reduction(+ : counton)
+    for (size_t i = 0; i < _nobs; i++) {
+      if (connected_nodes[i] == 1)
+        counton++;
+    }
+    cov = (Distance)counton / _nobs;
+
+    if (cov >= coverage) {
+      // previous cov is closer to coverage then choose prev p instead current
+      // p
+      if (cov - coverage > coverage - pcov) {
+        p = pp;
+        cov = pcov;
+      }
+
+      break;
+    } else
+      verbose_message("Preparing TNF Graph Building [pTNF = %2.1f; %d / %d (P "
+                      "= %2.2f%%) round %d]               \r",
+                      p / 10., counton, _nobs, cov * 100., round);
+
+    pp = p;
+    pcov = cov;
+
+    if (p > 990)           // 99.9, 99.6, 99.3, 99.0
+      p -= rand() % 3 + 1; // choose from 1,2,3
+    else if (p > 900)      // 98.5, 98, 97.5, ... 90.0
+      p -= rand() % 3 + 3; // choose from 3,4,5
+    else                   // 89, 88, 87, ..., 70
+      p -= rand() % 3 + 9; // choose from 9,10,11
+  }
+
+  free(matrix);
+  return p;
+}
+
+void rescue_singletons(ClassMap &cls) {
+  // handle singleton bins that are of cluster size themselves
+  verbose_message("There are %d bins already\n", cls.size());
+  std::unordered_set<size_t> large_unbinned;
+  for (auto i = 0; i < nobs; i++) {
+    if (seqs[i].size() >= minClsSize) {
+      large_unbinned.insert(i);
+    }
+  }
+  for (auto it = cls.begin(); it != cls.end(); ++it) {
+    size_t kk = it->first;
+    size_t s = 0, s1 = 0;
+
+    for (auto it2 = cls[kk].begin(); it2 != cls[kk].end(); ++it2) {
+      if (*it2 < nobs) {
+        if (seqs[*it2].size() >= minClsSize)
+          large_unbinned.erase(*it2); // it was binned!
+      }
+    }
+  }
+  if (verbose && large_unbinned.size() > 0)
+    verbose_message("Rescued %d large contig(s) into singleton bin(s)\n",
+                    large_unbinned.size());
+  for (auto id : large_unbinned) {
+    assert(cls.find(id) == cls.end());
+    cls[id].push_back(id);
+  }
+}
+
+void output_bins(ClassMap &cls) {
+#pragma omp parallel
+  {
+#pragma omp single
+    {
+      std::string outFile_info = outFile + ".BinInfo.txt";
+      std::ofstream os_info(outFile_info.c_str());
+      verbose_message("Writing cluster stats to: %s\n", outFile_info.c_str());
+      os_info << "BinNum\tNumContigs\tTotalLength\tLengthWeightedAvgCoveage\tFileName\n";
+
+      std::string outFile_members = outFile + ".BinMembers.txt";
+      std::ofstream os_members(outFile_members.c_str());
+      verbose_message("Writing Members stats to: %s\n", outFile_members.c_str());
+      os_members << "BinNum\tSequenceName\tTotalDepth\n";
+
+      Distance binnedSize = 0, binnedSize1 = 0;
+      std::vector<size_t> clsMap(nobs + nobs1, 0);
+
+      size_t bin_id = 1; // start with bin #1
+      for (auto it = cls.begin(); it != cls.end(); ++it) {
+        size_t kk = it->first;
+        assert(kk >= 0);
+        size_t s = 0, s1 = 0;
+        size_t numContigs = 0, totalLength = 0;
+        double lengthWeightedAvgCoverage = 0;
+        {
+          const auto &cluster =
+              it->second; // in new block for compatiblity with old OpenMP
+                          // standard that does not support references in
+                          // private vars
+
+          std::stringstream ss;
+          for (auto it2 = cluster.begin(); it2 != cluster.end(); ++it2) {
+            size_t len = 0;
+            
+            auto idx = (*it2 < nobs) ? *it2 : *it2 - nobs;
+            if (*it2 < nobs) {
+              len = seqs[idx].size();
+              s += len;
+            } else {
+              len = small_seqs[idx].size();
+              s1 += len;
+            }
+
+            string &sequence_name = (*it2 < nobs) ? contig_names[idx] : small_contig_names[idx];
+            
+            numContigs++;
+            totalLength += len;
+
+            double total = 0.0;
+            
+            for (auto i = 0; i < nABD; i++) {
+              auto d = (*it2 < nobs) ? ABD(idx,i) : small_ABD(idx,i);
+              total += d;
+            }
+            lengthWeightedAvgCoverage += len * total;
+            ss << bin_id << "\t" << sequence_name << "\t" << total << "\n";
+          }
+
+          if (s + s1 < minClsSize) {
+            continue;
+          }
+          os_members << ss.str();
+
+          for (size_t i = 0; i < cluster.size(); ++i) {
+            assert(cluster[i] < (int)clsMap.size());
+            clsMap[cluster[i]] = kk + 1;
+          }
+        }
+        std::string outFile_cls = outFile + ".";
+        outFile_cls.append(boost::lexical_cast<std::string>(bin_id));
+        if (!onlyLabel)
+          outFile_cls.append(".fa");
+
+        if (totalLength > 0)
+          lengthWeightedAvgCoverage /= totalLength;
+        else
+          lengthWeightedAvgCoverage = 0;
+        os_info << bin_id << "\t" << numContigs << "\t" << totalLength << "\t"
+                << lengthWeightedAvgCoverage << "\t" << outFile_cls << "\n";
+
+        binnedSize += s;
+        binnedSize1 += s1;
+
+#pragma omp task firstprivate(outFile_cls)
+        if (!noBinOut) {
+          auto &cluster = it->second; // in new block for compatiblity with
+                                      // old OpenMP standard that does not
+                                      // support references in private vars
+
+          std::sort(
+              cluster.begin(),
+              cluster.end()); // deterministic ordering of contigs within bins
+
+          size_t bases = 0;
+          std::ofstream os(outFile_cls.c_str());
+          if (!os) {
+            cerr << "[Error!] Could not write to " << outFile_cls << endl;
+            exit(1);
+          }
+          char os_buffer[buf_size];
+          os.rdbuf()->pubsetbuf(os_buffer, buf_size);
+          for (auto it2 = cluster.begin(); it2 != cluster.end(); ++it2) {
+            std::stringstream labelss;
+            auto idx = (*it2 < nobs) ? *it2 : *it2 - nobs;
+            const string &n = (*it2 < nobs) ? contig_names[idx]
+                                          : small_contig_names[idx];
+            labelss << n;
+            if (abdFile.length()) {
+              assert(ABD.size1() == nobs);
+              assert(ABD.size2() == nABD);
+              assert(small_ABD.size1() == nobs1);
+              assert(small_ABD.size2() == nABD);
+              labelss << " total_depth=";
+              double total = 0.0;
+              for (auto i = 0; i < nABD; i++)
+                total += (*it2 < nobs) ? ABD(idx,i) : small_ABD(idx,i);
+              labelss << std::fixed << std::setprecision(2) << total;
+
+              if (!noSampleDepths) {
+                labelss << " sample_depths";
+                labelss << std::fixed << std::setprecision(1);
+                for (auto i = 0; i < nABD; i++) {
+                  labelss << (i == 0 ? "=" : ",");
+                  auto d = (*it2 < nobs) ? ABD(idx,i) : small_ABD(idx,i);
+                  if (d >= 0.1)
+                    labelss << d;
+                  else
+                    labelss << "0";
+                }
+              }
+            }
+            std::string label = labelss.str();
+            if (onlyLabel) {
+              os << label << line_delim;
+            } else {
+              std::string &seq = (*it2 < nobs) ? seqs[idx] : small_seqs[idx];
+              printFasta(os, label, seq);
+              bases += seq.size();
+            }
+          }
+          os.close();
+          if (!os) {
+            cerr << "[Error!] Failed to write to " << outFile_cls << endl;
+            exit(1);
+          }
+
+          if (debug)
+            #pragma omp critical (COUT)
+            cout << "Bin " << bin_id << " (" << bases << " bases in "
+                 << cluster.size() << " contigs) was saved to: " << outFile_cls
+                 << endl;
+        }
+
+        bin_id++;
+      }
+
+      if (saveCls) {
+#pragma omp task
+        {
+
+          string outFile_matrix = outFile + ".MemberMatrix.txt";
+          if (verbose)
+            verbose_message("Saving cluster membership matrix to %s\n",
+                            outFile_matrix.c_str());
+
+          std::ofstream os(outFile_matrix.c_str());
+          if (!os) {
+            cerr << "[Error!] Could not write cluster membership to " << outFile_matrix
+                 << endl;
+            exit(1);
+          }
+          char os_buffer[buf_size];
+          os.rdbuf()->pubsetbuf(os_buffer, buf_size);
+
+          os << "ContigName" << tab_delim << "ClusterId" << line_delim;
+          for (size_t i = 0; i < nobs; ++i) {
+            os << contig_names[i] << tab_delim << clsMap[i] << line_delim;
+          }
+          for (size_t i = nobs; i < nobs + nobs1; ++i) {
+            auto idx = i - nobs;
+            os << small_contig_names[idx] << tab_delim << clsMap[i]
+               << line_delim;
+          }
+
+          os.flush();
+          os.close();
+          if (!os) {
+            cerr << "[Error!] Failed to write cluster membership to " << outFile
+                 << endl;
+            exit(1);
+          }
+        }
+      }
+
+      if (outUnbinned) {
+#pragma omp task
+        {
+          std::string outFile_cls = outFile + ".";
+          outFile_cls.append("unbinned");
+          if (!onlyLabel)
+            outFile_cls.append(".fa");
+
+          if (verbose)
+            verbose_message("Saving unbinned contigs to %s\n",
+                            outFile_cls.c_str());
+
+          std::ofstream os(outFile_cls.c_str());
+          if (!os) {
+            cerr << "[Error!] Could not to write unbinned contigs to "
+                 << outFile_cls << endl;
+            exit(1);
+          }
+          char os_buffer[buf_size];
+          os.rdbuf()->pubsetbuf(os_buffer, buf_size);
+
+          for (size_t i = 0; i < clsMap.size(); ++i) {
+            if (clsMap[i] == 0) {
+              auto idx = (i < nobs) ? i : i - nobs;
+              std::string &label =
+                  ((i < nobs) ? contig_names[idx] : small_contig_names[idx]);
+              if (onlyLabel) {
+                os << label << line_delim;
+              } else {
+                std::string &seq = (i < nobs) ? seqs[idx] : small_seqs[idx];
+                printFasta(os, label, seq);
+              }
+            }
+          }
+          os.flush();
+          os.close();
+          if (!os) {
+            cerr << "[Error!] Failed to write unbinned contigs to "
+                 << outFile_cls << endl;
+            exit(1);
+          }
+        }
+      }
+
+#pragma omp taskwait
+
+      if (verbose) {
+        verbose_message(
+            "%2.2f%% (%lld bases) of large (>=%d) and %2.2f%% (%lld bases) "
+            "of "
+            "small (<%d) contigs were binned.\n",
+            (Distance)binnedSize / totalSize * 100.,
+            (unsigned long long)binnedSize, minContig,
+            binnedSize1 == 0 ? 0 : (Distance)binnedSize1 / totalSize1 * 100.,
+            (unsigned long long)binnedSize1, minContig);
+      }
+
+#pragma omp critical (COUT)
+      {
+        cout.precision(20);
+        cout << bin_id - 1 << " bins (" << binnedSize + binnedSize1
+             << " bases in total) formed." << std::endl;
+      }
+
+    } // omp single
+  }   // omp parallel
+}
+
+template <typename D>
+double _cal_abd_corr(size_t r1, size_t r2, const Matrix &ABD1,
+                     const Matrix &ABD2) {
+  assert(nABD > 1);
+  int i;
+  double sum_xsq = 0.0;
+  double sum_ysq = 0.0;
+  double sum_cross = 0.0;
+  D ratio;
+  D delta_x, delta_y;
+  double mean_x = 0.0, mean_y = 0.0;
+  D r = 0.0;
+
+  for (i = 0; i < nABD; ++i) {
+    D m1 = ABD1(r1, i);
+    D m2 = ABD2(r2, i);
+
+    if (i == 0) {
+      mean_x = m1;
+      mean_y = m2;
+      continue;
+    }
+    D i_plus1 = i + 1;
+    ratio = i / i_plus1;
+    delta_x = m1 - mean_x;
+    delta_y = m2 - mean_y;
+    sum_xsq += delta_x * delta_x * ratio;
+    sum_ysq += delta_y * delta_y * ratio;
+    sum_cross += delta_x * delta_y * ratio;
+    mean_x += delta_x / i_plus1;
+    mean_y += delta_y / i_plus1;
+  }
+
+  r = sum_cross / (sqrt(sum_xsq) * sqrt(sum_ysq));
+
+  return r;
+}
+
+double cal_abd_corr(size_t r1, size_t r2, bool second_is_small,
+                    bool first_is_centroid) {
+  return _cal_abd_corr<CALC_TYPE>(r1, r2,
+                                  first_is_centroid ? ABD_centroids : ABD,
+                                  second_is_small ? small_ABD : ABD);
+}
