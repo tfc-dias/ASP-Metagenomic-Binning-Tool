@@ -1,7 +1,7 @@
 % Separation operator: splits chimeric seed bins
 
 % simthresh: Co-marker distance threshold for dissimilarity
-#const simthresh=50.
+#const simthresh=50.   % placeholder: derived per dataset and passed with -c (scripts/derive_simthresh.py)
 
 % sepmul: Multiplier scaling cannot-link penalty against anchor affinity
 #const sepmul=1.

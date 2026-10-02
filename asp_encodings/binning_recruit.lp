@@ -4,7 +4,7 @@
 #const threshold_conta=1.
 
 % conta_simthresh: Distance threshold distinguishing intra-genome from cross-genome co-markers
-#const conta_simthresh=50.
+#const conta_simthresh=50.   % placeholder: derived per dataset and passed with -c (scripts/derive_simthresh.py)
 
 % minaff: Minimum realized affinity required to recruit a contig (0 = disabled)
 #const minaff=0.

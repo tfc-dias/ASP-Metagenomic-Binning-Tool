@@ -1,0 +1,4 @@
+# local configuration
+config.sh
+# run outputs
+refine_out/

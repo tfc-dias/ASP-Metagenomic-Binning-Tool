@@ -1,10 +1,11 @@
 % Merge operator: consolidates over-split bins sharing high affinity
 
 % simthresh: Co-marker distance threshold for dissimilarity
-#const simthresh=50.
+#const simthresh=50.   % placeholder: derived per dataset and passed with -c (scripts/derive_simthresh.py)
 
 % minconn: Minimum crossing affinity edge count to qualify candidate bin pairs
-#const minconn=50.
+% (0 = off: the contamination guard alone decides which mutual pairs merge)
+#const minconn=0.
 
 bin(B)    :- seed(B,_).
 binc(B,C) :- seed(B,C).

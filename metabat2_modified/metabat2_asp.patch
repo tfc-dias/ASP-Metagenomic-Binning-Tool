@@ -1,0 +1,167 @@
+--- a/src/metabat2.cpp
++++ b/src/metabat2.cpp
+@@ -733,6 +733,133 @@
+   verbose_message("Finished contig TNF calculation.  [%.1fGb / %.1fGb]         "
+                   "                       \n",
+                   getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
++  // =========================================================================
++  // ASP PIPELINE INTERFACE: EXPORT DISTANCE PREDICATES AND EXIT
++  // 1. Default: Fall through to graph building and dump MetaBAT2 native composite
++  //    edge scores (g.sSCR) to composite_raw.lp.
++  // 2. All-pairs (legacy): Set env ASP_DUMP_RAW=1 to dump raw TNF and abundance
++  //    probabilities for all pairs (tnf_raw.lp, abd_raw.lp).
++  // 3. Selective pairs: Set env ASP_DUMP_PAIRS=<file> to evaluate distance
++  //    functions for a supplied list of pairs (comarker_raw.lp).
++  // Modes exit immediately after writing facts. Precedence: ASP_DUMP_RAW,
++  // ASP_DUMP_PAIRS, then the default composite dump.
++  // =========================================================================
++  if (getenv("ASP_DUMP_RAW")) {
++    verbose_message("Writing RAW ASP facts to tnf_raw.lp and abd_raw.lp...\n");
++    std::ofstream f_tnf("tnf_raw.lp");
++    std::ofstream f_abd("abd_raw.lp");
++
++    for (size_t i = 0; i < nobs; ++i) {
++      for (size_t j = i + 1; j < nobs; ++j) {
++        std::string id1 = contig_names[i];
++        std::string id2 = contig_names[j];
++
++        // 1. TNF Distance (Metabat2 logistic regression model)
++        double tnf_prob = cal_tnf_dist(i, j, TNF, TNF);
++        int tnf_int = (int)(tnf_prob * 100); // Scale probability to an integer 0-100
++
++        // 2. Abundance Distance (Overlapping Normal Distributions)
++        double abd_total = 0;
++        int valid_samples = 0;
++        for(size_t s = 0; s < nABD; ++s) {
++            bool nz = false;
++            double dist = cal_abd_dist(i, j, s, nz);
++            if(nz) { abd_total += dist; valid_samples++; }
++        }
++        double abd_prob = valid_samples > 0 ? (abd_total / valid_samples) : 1.0;
++        int abd_int = (int)(abd_prob * 100);
++
++        // Write with string IDs (we will map to ASP integers later)
++        f_tnf << "tnf(\"" << id1 << "\",\"" << id2 << "\"," << tnf_int << ").\n";
++        f_abd << "abd(\"" << id1 << "\",\"" << id2 << "\"," << abd_int << ").\n";
++      }
++    }
++    f_tnf.close();
++    f_abd.close();
++    verbose_message("Successfully wrote RAW ASP predicates. Exiting early!\n");
++    return 0; // Exit program!
++  }
++
++  // ==========================================
++  // ASP PAIR-LIST DUMP: MetaBAT2's cal_tnf_dist + cal_abd_dist evaluated on a
++  // supplied list of contig pairs, rather than all O(n^2) pairs.
++  //
++  // Contamination separation and merge guard checks require distances for pairs
++  // sharing single-copy marker genes. Because these pairs form an arbitrary sparse
++  // subset not fully covered by the TNF-pruned graph, this mode evaluates exact
++  // distances on demand in O(|P|) time, scaling efficiently to large assemblies.
++  //
++  // Usage:  ASP_DUMP_PAIRS=<pairs.tsv> metabat2 -i <fasta> -a <depth> -m 1500
++  //   pairs.tsv : whitespace-separated contig pairs per line.
++  //   output    : comarker_raw.lp, emitting comarker_sim("name1","name2",D).
++  //
++  // Distance D = tnf_int + abd_int, each scaled x100, yielding range 0..200
++  // (low D = high similarity). Unkept contigs are omitted and handled downstream.
++  // ==========================================
++  if (const char *asp_pairs_file = getenv("ASP_DUMP_PAIRS")) {
++    verbose_message("Reading ASP pair list from %s ...\n", asp_pairs_file);
++    std::ifstream f_pairs(asp_pairs_file);
++    if (!f_pairs) {
++      std::cerr << "[Error!] ASP_DUMP_PAIRS: cannot open " << asp_pairs_file
++                << std::endl;
++      return 1;
++    }
++
++    std::unordered_map<std::string, size_t> name2idx;
++    name2idx.reserve(nobs * 2);
++    for (size_t i = 0; i < nobs; ++i)
++      name2idx[contig_names[i]] = i;
++
++    std::ofstream f_cm("comarker_raw.lp");
++    f_cm << "% comarker_sim(C1,C2,D): MetaBAT2-NATIVE cal_tnf_dist + cal_abd_dist on a\n"
++            "% supplied pair list. D = tnf*100 + abd*100, range 0..200, low = similar.\n";
++
++    std::string n1, n2;
++    size_t nread = 0, nwrote = 0, nmiss = 0;
++    while (f_pairs >> n1 >> n2) {
++      ++nread;
++      std::unordered_map<std::string, size_t>::const_iterator it1 = name2idx.find(n1);
++      std::unordered_map<std::string, size_t>::const_iterator it2 = name2idx.find(n2);
++      if (it1 == name2idx.end() || it2 == name2idx.end()) {
++        ++nmiss;
++        continue;
++      }
++      size_t i = it1->second, j = it2->second;
++      if (i == j) {
++        ++nmiss;
++        continue;
++      }
++
++      // Identical arithmetic to ASP_DUMP_RAW above, on one pair instead of all.
++      double tnf_prob = cal_tnf_dist(i, j, TNF, TNF);
++      int tnf_int = (int)(tnf_prob * 100);
++
++      double abd_total = 0;
++      int valid_samples = 0;
++      for (size_t s = 0; s < nABD; ++s) {
++        bool nz = false;
++        double dist = cal_abd_dist(i, j, s, nz);
++        if (nz) {
++          abd_total += dist;
++          valid_samples++;
++        }
++      }
++      double abd_prob = valid_samples > 0 ? (abd_total / valid_samples) : 1.0;
++      int abd_int = (int)(abd_prob * 100);
++
++      f_cm << "comarker_sim(\"" << n1 << "\",\"" << n2 << "\","
++           << (tnf_int + abd_int) << ").\n";
++      ++nwrote;
++    }
++    f_cm.close();
++    verbose_message("Wrote %d comarker_sim facts to comarker_raw.lp (%d pairs read, "
++                    "%d skipped: contig not kept). Exiting early!\n",
++                    (int)nwrote, (int)nread, (int)nmiss);
++    return 0; // Exit program!
++  }
++
++  // Default path: continue into graph building, dump native composite below.
++  // ==========================================
+ 
+   ClassMap cls;
+   do {
+@@ -869,6 +996,30 @@
+         g.sSCR = g.sTNF;
+       }
+ 
++      // ==========================================
++      // ASP COMPOSITE DUMP: MetaBAT2's NATIVE pairwise edge score (g.sSCR) --
++      // the sparse, TNF-pruned neighbour graph it actually clusters on, combining
++      // TNF + abundance + abundance-correlation via the geometric mean above.
++      // Emitted as a SIMILARITY (higher = more similar). Integer scaling for ASP
++      // weak-constraint weights is done downstream in Python (range inspected there).
++      // Keeps MetaBAT2's native edge set (no top-k re-imposed).
++      // ==========================================
++      {
++        verbose_message("Writing ASP composite facts to composite_raw.lp (%d edges)...\n",
++                        (int)g.sSCR.size());
++        std::ofstream f_cmp("composite_raw.lp");
++        f_cmp << std::fixed;
++        f_cmp.precision(6);
++        for (size_t e = 0; e < g.sSCR.size(); ++e) {
++          f_cmp << "composite(\"" << contig_names[g.to[e]] << "\",\""
++                << contig_names[g.from[e]] << "\"," << g.sSCR[e] << ").\n";
++        }
++        f_cmp.close();
++        verbose_message("Successfully wrote composite ASP predicates. Exiting!\n");
++        return 0; // Exit program -- facts extracted, no clustering needed.
++      }
++      // ==========================================
++
+       std::vector<StoredDistance>().swap(g.sTNF);
+       ABD_VAR.clear();
+       ABD_VAR.resize(0, 0, false);
