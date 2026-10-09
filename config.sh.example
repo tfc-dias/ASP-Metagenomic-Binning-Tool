@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# Configuration for refine.sh. Copy this file to config.sh, in the same directory as refine.sh,
-# and set the location of the modified MetaBAT2.
+# Optional configuration for refine.sh. Copy this file to config.sh, in the same directory as
+# refine.sh, only if a default below needs changing.
 
-# Required: the modified MetaBAT2 binary built from metabat2_modified/ (see its README.md).
-METABAT2_MODIFIED="$HOME/metabat-asp/build/src/metabat2"
-
-# Optional. The defaults below use the programs of that name on the system path; change them only
-# if a program is installed elsewhere.
+# The defaults use the programs of that name on the system path; change them only if a program is
+# installed elsewhere.
 CLINGO=clingo        # clingo 5.4 or later
-PYTHON=python3       # Python 3.10 or later
+PYTHON=python3       # Python 3.10 or later; with numpy and scipy for the default --backend python
 
-# Optional. Needed only if the modified MetaBAT2 fails to start because it cannot find its shared
-# libraries: the directory that contains them.
-METABAT2_MODIFIED_LIBS=""
+# Only for --backend metabat2: the modified MetaBAT2 binary built from metabat2_modified/ (see its
+# README.md), and, if it fails to start because it cannot find its shared libraries, the
+# directory that contains them.
+# METABAT2_MODIFIED="$HOME/metabat-asp/build/src/metabat2"
+# METABAT2_MODIFIED_LIBS=""
 
 # Solver time limits (seconds) and threads may also be set here or as environment variables:
 # SEP_TL=600  MRG_TL=180  REC_TL=900  THREADS=8

@@ -21,54 +21,46 @@ method requires neither reference genomes nor a ground truth.
 | Software | Notes |
 |---|---|
 | clingo 5.4 or later | Available from conda-forge (`conda install -c conda-forge clingo`). |
-| Python 3.10 or later | Only the standard library is used. |
-| **Modified MetaBAT2** | Always required; see [Modified MetaBAT2](#modified-metabat2). |
+| Python 3.10 or later, with numpy and scipy | `pip install numpy scipy`, or from conda-forge. |
 
-## Modified MetaBAT2
+Nothing needs to be compiled. The modified MetaBAT2 is optional (see [Backends](#backends)).
 
-The operators rely on two quantities computed by MetaBAT2: its pairwise contig similarity, which
+## MetaBAT2's features
+
+The operators rely on two quantities defined by MetaBAT2: its pairwise contig similarity, which
 combines tetranucleotide frequency and coverage, and its distance between contigs that share a
-marker gene. The modified MetaBAT2 in `metabat2_modified/` exports these quantities and exits
-without binning. The seed binning determines the initial bins; these quantities determine how the
-operators modify them. The modified MetaBAT2 is therefore required regardless of the binner that
-produced the seed.
+marker gene. The seed binning determines the initial bins; these quantities determine how the
+operators modify them, so they are used whichever binner produced the seed.
 
-### Installation
+`scripts/mb2_features.py` computes both in Python. It is a port of MetaBAT2's own functions
+(tetranucleotide frequencies, `cal_tnf_dist`, `cal_abd_dist`, the abundance correlation, the
+construction of its similarity graph and its edge score), at the commit
+`c869c524d0f131d60a03be64bd26b89738160652`, with MetaBAT2's default settings, and was validated
+against MetaBAT2 compiled with the patch in `metabat2_modified/`. `refine.sh` runs it
+automatically; it never produces a binning.
 
-The modified MetaBAT2 is built once, from a specific MetaBAT2 commit:
+### Backends
 
-```
-git clone https://bitbucket.org/berkeleylab/metabat.git metabat-asp
-cd metabat-asp
-git checkout c869c524d0f131d60a03be64bd26b89738160652
-git apply /path/to/metabat2_modified/metabat2_asp.patch
-mkdir build && cd build && cmake .. && make
-```
+The features can be computed in two ways, selected with `--backend`:
 
-The resulting binary is `build/src/metabat2`.
+| `--backend` | Computes the features with | Requires |
+|---|---|---|
+| `python` (default) | `scripts/mb2_features.py` | numpy and scipy |
+| `metabat2` | MetaBAT2 compiled with the patch in `metabat2_modified/`, which exports the same quantities | The modified MetaBAT2, built as described in `metabat2_modified/README.md`, and `METABAT2_MODIFIED` set in `config.sh` |
 
-### Invocation
-
-The modified MetaBAT2 is not run by the user: `refine.sh` invokes it automatically whenever these
-quantities are needed, and it never produces a binning. Its operating modes are described in
-`metabat2_modified/README.md`.
+Both give the same features and, on the assemblies tested, identical binnings. The Python
+backend needs no compilation; the MetaBAT2 backend is the one the dissertation's results were
+produced with. The backend is recorded in `run_info.txt`, and an output directory cannot be
+resumed with a different backend.
 
 ## Configuration
 
-The locations of the required programs are set in a configuration file, created from the template
-provided:
+No configuration is needed when `clingo` and `python3` are on the system path. Otherwise, their
+locations are set in a configuration file created from the template provided:
 
 ```
 cp config.sh.example config.sh
 ```
-
-Only one setting is required: `METABAT2_MODIFIED`, the location of the modified MetaBAT2 binary.
-The remaining settings can normally be left as they are in the template:
-
-* `CLINGO` and `PYTHON` default to the programs of those names on the system path, and need to be
-  changed only if a program is installed elsewhere.
-* `METABAT2_MODIFIED_LIBS` is needed only if the modified MetaBAT2 fails to start because it cannot
-  find its shared libraries (see [Troubleshooting](#troubleshooting)).
 
 ## Usage
 
@@ -96,6 +88,7 @@ The same validation is performed at the start of every run.
 | `--operators` | Operators to apply, and their order. | Default `separate,merge,recruit`; see [Operator selection](#operator-selection). |
 | `--out` | Output directory. | Default `refine_out/<name>`. |
 | `--write-bins` | Also write the final binning as a directory of FASTA files, one per bin. | |
+| `--backend` | How MetaBAT2's features are computed: `python` or `metabat2`. | Default `python`; see [Backends](#backends). |
 | `--check` | Validate the configuration and the inputs, then stop. | |
 | `--version` | Print the version. | |
 
@@ -163,7 +156,7 @@ All outputs are written to `refine_out/<name>/`, or to the directory given by `-
 | `pred_seed.tsv` | The seed binning, restricted to the contigs the method operates on. |
 | `pred_separate.tsv`, `pred_separate_merge.tsv`, `pred_separate_merge_recruit.tsv` | The output of each stage, before the minimum bin size filter, recorded for inspection. |
 | `summary.tsv` | The changes made by each stage, and whether the solver proved its result optimal (described below). |
-| `run_info.txt` | The versions of the tool, clingo, Python and MetaBAT2, the command line and all parameters used. |
+| `run_info.txt` | The versions of the tool, clingo, Python, and numpy and scipy or the modified MetaBAT2 (depending on the backend), the command line and all parameters used. |
 | `simthresh_used.txt` | The distance threshold used, and whether it was derived or set manually. |
 | `run.log` | The complete log of the run. |
 | `work/` | Intermediate facts and solver outputs, with one directory per stage under `work/stages/`. |
@@ -237,18 +230,12 @@ use is recorded in the run's output directory, in `run.log` and in `run_info.txt
 
 ## Large assemblies
 
-On assemblies of tens of thousands of contigs, separation and recruitment typically reach their
-time limits before proving their results optimal; `summary.tsv` indicates which stages did so. The
-implications differ between the two operators:
-
-* **Recruitment** reaches a good solution early and improves it only marginally thereafter. On a
-  benchmark of 47,644 contigs in the dissertation, its objective value and quality scores were
-  identical at 110 s and at 300 s. The default time limit is therefore generous.
-* **Separation** may return different, near-equivalent partitions under different time limits on
-  the most difficult assemblies. On one real assembly of 45,320 contigs, time limits of 600 s,
-  1,800 s and 3,600 s produced partitions whose objective values differed by less than 0.3 % but
-  which differed in approximately one third of the contig assignments. Increasing `SEP_TL` does not
-  necessarily remove this variation; the time limit used should be reported.
+On assemblies of tens of thousands of contigs, separation and recruitment may reach their time
+limits before proving their results optimal; `summary.tsv` indicates which stages did so, and their
+result is the best found. Recruitment reaches a good solution early, so its default time limit is
+generous. Separation may return different, near-equivalent partitions under different time limits
+on the most difficult assemblies; increasing `SEP_TL` does not necessarily remove this variation,
+and the time limit used should be reported.
 
 ## Notes and limitations
 
@@ -284,14 +271,15 @@ implications differ between the two operators:
 
 | Message | Cause and resolution |
 |---|---|
-| `missing .../config.sh` | The configuration file is missing. Copy `config.sh.example` to `config.sh` and set the paths. |
-| `clingo not found`, `Python 3.10+ not found`, `modified MetaBAT2 not found` | A program path is incorrect. Set `CLINGO`, `PYTHON` or `METABAT2_MODIFIED` in `config.sh` accordingly. |
+| `clingo not found`, `Python 3.10+ not found` | A program path is incorrect. Set `CLINGO` or `PYTHON` in `config.sh` accordingly. |
+| `numpy and scipy are required` | Install them for the Python that runs the tool (`pip install numpy scipy`), or use `--backend metabat2`. |
+| `METABAT2_MODIFIED is not set`, `modified MetaBAT2 not found` (with `--backend metabat2`) | Set `METABAT2_MODIFIED` in `config.sh` to the modified MetaBAT2 binary. |
+| `... is not the MODIFIED MetaBAT2` | `METABAT2_MODIFIED` points to an unmodified MetaBAT2, or the patch was not applied when it was built. Rebuild it as described in `metabat2_modified/README.md`; check that `git apply` reported no error. |
 | `error while loading shared libraries` when MetaBAT2 runs | The modified MetaBAT2 cannot locate a library it was built against. Set `METABAT2_MODIFIED_LIBS` in `config.sh` to the directory containing it. |
-| `git apply` fails, or the build reports `'fullHeader' was not declared` | MetaBAT2 is not at the required commit. Run the `git checkout` step of the installation before `git apply`. |
-| cmake: `Could NOT find Boost` | The Boost development libraries are missing. Install them (for example, `libboost-all-dev`, or `boost` from conda-forge). |
+| `modified MetaBAT2 did not write composite_raw.lp` | MetaBAT2 itself failed. Its error message appears immediately above in `run.log`. |
 | `depth: contigs are not in the same order as in the assembly` | The depth file was produced from a different version of the assembly, or reordered afterwards. Regenerate it from the same FASTA file. |
 | `none of its contig names occur in the assembly` (seed or markers) | The contig names differ from the FASTA headers (for example, renamed contigs, or full headers instead of their first word). The same names must be used. |
-| `modified MetaBAT2 did not write composite_raw.lp` | MetaBAT2 itself failed. Its error message appears immediately above in `run.log`. |
+| `the contig features could not be computed` | The assembly or the depth file could not be read. The error message appears immediately above in `run.log`. |
 | `... was made with different settings ... Use a new --out` | The output directory belongs to a run with a different seed or different parameters. Use a new output directory. |
 | `the prediction has N contigs, expected at least M` | clingo was stopped by its time limit while writing its result. Increase the time limit of that operator (`SEP_TL`, `MRG_TL` or `REC_TL`) and run again; completed stages are retained. |
 | `simthresh COULD NOT BE DERIVED` | The seed contains no marker-sharing contigs within the same bin, or none across different bins, so the threshold cannot be derived. The value 50 is used, and should be reported as such. |
@@ -304,5 +292,5 @@ refine.sh             Main command.
 config.sh.example     Template for the configuration file (config.sh).
 asp_encodings/        The three operators, as clingo programs.
 scripts/              Auxiliary scripts invoked by refine.sh; not intended to be run directly.
-metabat2_modified/    Patch to MetaBAT2 that exports its features, and MetaBAT2's license.
+metabat2_modified/    Patch to MetaBAT2 that exports its features (for --backend metabat2).
 ```

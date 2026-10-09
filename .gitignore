@@ -2,3 +2,5 @@
 config.sh
 # run outputs
 refine_out/
+# Python bytecode
+__pycache__/

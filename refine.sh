@@ -22,6 +22,9 @@
 #              any stage whose output exists is skipped. Use a new --out for a different seed or
 #              different settings.
 #   --write-bins  also write the final binning as a folder of FASTA files, one per bin.
+#   --backend  how MetaBAT2's contig features are computed: python (default; a Python port, needs
+#              numpy and scipy) or metabat2 (the modified MetaBAT2 binary, set METABAT2_MODIFIED in
+#              config.sh). Both give the same features; see the README.
 #   --check    only check the configuration and the inputs, then stop.
 #
 # Advanced (change the method's defaults; for sensitivity studies, not for normal use):
@@ -39,7 +42,7 @@ VERSION="1.0.0"
 usage(){ sed -n '3,/^# =====/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 1; }
 
 NAME="" FASTA="" DEPTH="" SEED="" OUT="" OPERATORS="separate,merge,recruit"
-WRITE_BINS=0 CHECK_ONLY=0 ST_OVERRIDE="" SEPMUL=1 MINCONN=0 MINBIN=200000
+WRITE_BINS=0 CHECK_ONLY=0 ST_OVERRIDE="" SEPMUL=1 MINCONN=0 MINBIN=200000 BACKEND=python
 CMDLINE="$0 $*"
 MARKERS="" MARK_ARGS=()
 while [ $# -gt 0 ]; do
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
     --operators)     OPERATORS="$2"; shift 2 ;;
     --write-bins)    WRITE_BINS=1; shift ;;
     --check)         CHECK_ONLY=1; shift ;;
+    --backend)       BACKEND="$2"; shift 2 ;;
     --simthresh)     ST_OVERRIDE="$2"; shift 2 ;;
     --sepmul)        SEPMUL="$2"; shift 2 ;;
     --minconn)       MINCONN="$2"; shift 2 ;;
@@ -73,6 +77,7 @@ IFS=',' read -r -a OPS <<< "$OPERATORS"
 for op in "${OPS[@]}"; do
   case "$op" in separate|merge|recruit) ;; *) echo "unknown operator '$op' (use separate, merge, recruit)"; exit 1 ;; esac
 done
+case "$BACKEND" in python|metabat2) ;; *) echo "unknown --backend '$BACKEND' (use python or metabat2)"; exit 1 ;; esac
 [ "$(printf '%s\n' "${OPS[@]}" | sort | uniq -d)" = "" ] || { echo "--operators: each operator at most once"; exit 1; }
 isint(){ case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
 [ -z "$ST_OVERRIDE" ] || { isint "$ST_OVERRIDE" && [ "$ST_OVERRIDE" -le 200 ]; } || { echo "--simthresh must be an integer in 0..200"; exit 1; }
@@ -80,7 +85,7 @@ for v in "$SEPMUL" "$MINCONN" "$MINBIN"; do isint "$v" || { echo "--sepmul, --mi
 # filtered outputs are named after the minimum bin size, e.g. _min200k
 if [ $((MINBIN % 1000)) -eq 0 ]; then FSUF="_min$((MINBIN / 1000))k"; else FSUF="_min${MINBIN}bp"; fi
 
-# Every path must be ABSOLUTE: the modified MetaBAT2 runs from inside the work folder.
+# Every path is made ABSOLUTE.
 for f in "$FASTA" "$DEPTH" "$SEED"; do [ -e "$f" ] || { echo "not found: $f"; exit 1; }; done
 for i in "${!MARK_ARGS[@]}"; do
   [ "${MARK_ARGS[$i]}" = --marker-file ] || [ -e "${MARK_ARGS[$i]}" ] || { echo "not found: ${MARK_ARGS[$i]}"; exit 1; }
@@ -95,11 +100,11 @@ done
 # ---- configuration -------------------------------------------------------------
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${REFINE_CONFIG:-$HERE/config.sh}"
-[ -f "$CONFIG" ] || { echo "missing $CONFIG (copy config.sh.example to config.sh and edit it)"; exit 1; }
+# config.sh is optional: every setting has a default
 # shellcheck source=/dev/null
-. "$CONFIG"
-# Settings from config.sh. Only METABAT2_MODIFIED has no default; CLINGO and PYTHON fall back to
-# the programs of that name on the system path.
+if [ -f "$CONFIG" ]; then . "$CONFIG"; fi
+# CLINGO and PYTHON fall back to the programs of that name on the system path. METABAT2_MODIFIED
+# is needed only with --backend metabat2.
 CLINGO="${CLINGO:-clingo}"
 PY="${PYTHON:-python3}"
 MODMB2="${METABAT2_MODIFIED:-}"
@@ -117,13 +122,23 @@ echo "Checking the configuration and the inputs:"
 preflight_fail=0
 command -v "$CLINGO" >/dev/null 2>&1 && echo "  ok       clingo: $("$CLINGO" --version 2>/dev/null | head -1)" \
   || { echo "  ERROR    clingo not found ($CLINGO); set CLINGO in config.sh"; preflight_fail=1; }
-"$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null && echo "  ok       python: $("$PY" --version 2>&1)" \
-  || { echo "  ERROR    Python 3.10+ not found ($PY); set PYTHON in config.sh"; preflight_fail=1; }
-if [ -z "$MODMB2" ]; then
-  echo "  ERROR    METABAT2_MODIFIED is not set in config.sh; build the modified MetaBAT2 (metabat2_modified/README.md) and set it"; preflight_fail=1
-elif [ -x "$MODMB2" ]; then
-  echo "  ok       modified MetaBAT2: $MODMB2"
-else echo "  ERROR    modified MetaBAT2 not found at $MODMB2; check METABAT2_MODIFIED in config.sh"; preflight_fail=1; fi
+if "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+  echo "  ok       python: $("$PY" --version 2>&1)"
+  if [ "$BACKEND" = python ]; then
+    "$PY" -c 'import numpy, scipy' 2>/dev/null \
+      && echo "  ok       numpy $("$PY" -c 'import numpy; print(numpy.__version__)'), scipy $("$PY" -c 'import scipy; print(scipy.__version__)')" \
+      || { echo "  ERROR    numpy and scipy are required by $PY (pip install numpy scipy), or use --backend metabat2"; preflight_fail=1; }
+  fi
+else echo "  ERROR    Python 3.10+ not found ($PY); set PYTHON in config.sh"; preflight_fail=1; fi
+if [ "$BACKEND" = metabat2 ]; then
+  if [ -z "$MODMB2" ]; then
+    echo "  ERROR    --backend metabat2: METABAT2_MODIFIED is not set in config.sh; build the modified MetaBAT2 (metabat2_modified/README.md) and set it"; preflight_fail=1
+  elif [ ! -x "$MODMB2" ]; then
+    echo "  ERROR    modified MetaBAT2 not found at $MODMB2; check METABAT2_MODIFIED in config.sh"; preflight_fail=1
+  elif ! grep -qa "ASP_DUMP_PAIRS" "$MODMB2" 2>/dev/null; then
+    echo "  ERROR    $MODMB2 is not the MODIFIED MetaBAT2 (the patch is not in it); see metabat2_modified/README.md"; preflight_fail=1
+  else echo "  ok       modified MetaBAT2: $MODMB2"; fi
+fi
 if [ "$preflight_fail" = 0 ]; then
   "$PY" "$HERE/scripts/check_inputs.py" --fasta "$FASTA" --depth "$DEPTH" --minlen "$MINLEN" \
        --markers "$MARKERS" "${MARK_ARGS[@]}" --seed "$SEED" || preflight_fail=1
@@ -135,7 +150,7 @@ if [ "$CHECK_ONLY" = 1 ]; then echo "All checks passed."; exit 0; fi
 OUT="${OUT:-$PWD/refine_out/$NAME}"
 mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 RES="$OUT"; WORK="$OUT/work"; F="$WORK/facts"
-mkdir -p "$F" "$WORK/moddump"
+mkdir -p "$F" "$WORK/features"
 LOG="$RES/run.log"
 
 log(){ echo "[$(date +%F' '%H:%M:%S)] $*" | tee -a "$LOG"; }
@@ -164,7 +179,7 @@ check_n(){  # $1=label  $2=new prediction  $3=minimum expected
 # A resumed run must use the same seed and the same settings, or the cached stages would belong
 # to another run. (Time limits and threads are not part of this: they do not change the problem.)
 SEED_DESC="$SEED"
-SETTINGS="seed=$SEED_DESC fasta=$FASTA minlen=$MINLEN markers=$MARKERS simthresh=${ST_OVERRIDE:-derived} sepmul=$SEPMUL minconn=$MINCONN"
+SETTINGS="seed=$SEED_DESC fasta=$FASTA minlen=$MINLEN markers=$MARKERS simthresh=${ST_OVERRIDE:-derived} sepmul=$SEPMUL minconn=$MINCONN backend=$BACKEND"
 if have "$RES/settings.txt" && [ "$(cat "$RES/settings.txt")" != "$SETTINGS" ]; then
   echo "$OUT was made with different settings:"
   echo "  before: $(cat "$RES/settings.txt")"
@@ -175,7 +190,7 @@ echo "$SETTINGS" > "$RES/settings.txt"
 
 log "===== START $NAME ====="
 log "fasta: $FASTA | depth: $DEPTH | markers: $MARKERS | seed: $SEED_DESC"
-log "operators: ${OPERATORS//,/ -> } | minlen=$MINLEN | threads=$THREADS | TL separate=$SEP_TL merge=$MRG_TL recruit=$REC_TL"
+log "operators: ${OPERATORS//,/ -> } | backend=$BACKEND | minlen=$MINLEN | threads=$THREADS | TL separate=$SEP_TL merge=$MRG_TL recruit=$REC_TL"
 log "out: $OUT"
 [ "$SEPMUL$MINCONN$MINBIN${ST_OVERRIDE}" = "10200000" ] || \
   log "NOTE: non-default settings: simthresh=${ST_OVERRIDE:-derived} sepmul=$SEPMUL minconn=$MINCONN min-bin-size=$MINBIN"
@@ -187,7 +202,12 @@ log "out: $OUT"
   echo "command             $CMDLINE"
   echo "clingo              $("$CLINGO" --version 2>/dev/null | head -1)"
   echo "python              $("$PY" --version 2>&1)"
-  echo "modified MetaBAT2   $("$MODMB2" -h 2>&1 | grep -m1 -o 'version [^)]*')  ($MODMB2)"
+  echo "features backend    $BACKEND"
+  if [ "$BACKEND" = python ]; then
+    echo "numpy / scipy       $("$PY" -c 'import numpy, scipy; print(numpy.__version__, "/", scipy.__version__)' 2>&1)"
+  else
+    echo "modified MetaBAT2   $(LD_LIBRARY_PATH="${MODMB2_LIBS:-}:${LD_LIBRARY_PATH:-}" "$MODMB2" -h 2>&1 | grep -m1 -o 'version [^)]*')  ($MODMB2)"
+  fi
   echo "seed                $SEED_DESC"
   echo "assembly            $FASTA"
   echo "depth               $DEPTH"
@@ -218,31 +238,52 @@ else
   have "$RES/pred_seed.tsv" || die "seed parse"
 fi
 
-# ---- 2) modified MetaBAT2 -> native composite affinity -------------------------
-# The features come from MetaBAT2 whatever binner made the seed: the operators read its
-# pairwise score and its distance functions.
-COMP="$WORK/moddump/composite_raw.lp"
-if have "$COMP"; then log "2) native composite — skip (exist)"
+# ---- 2) MetaBAT2's features -> native composite affinity -----------------------
+# The features are MetaBAT2's whatever binner made the seed: the operators read its pairwise
+# score and its distance functions, computed by mb2_features.py (a Python port of MetaBAT2's,
+# --backend python) or by the modified MetaBAT2 binary (--backend metabat2).
+FEAT="$WORK/features/features.npz"
+COMP="$WORK/features/composite_raw.lp"
+MODLD="${MODMB2_LIBS:-}:${LD_LIBRARY_PATH:-}"   # libraries for the modified binary, scoped to its calls
+if [ "$BACKEND" = metabat2 ]; then
+  if have "$COMP"; then log "2) native composite — skip (exist)"
+  else
+    log "2) modified MetaBAT2 (composite_raw.lp dump)"
+    # the modified binary may need its build's shared libraries; set METABAT2_MODIFIED_LIBS in config.sh if so
+    ( cd "$WORK/features" && LD_LIBRARY_PATH="$MODLD" \
+         "$MODMB2" -i "$FASTA" -a "$DEPTH" -o "$WORK/features/bin" -m "$MINLEN" --seed 1 ) \
+         >>"$LOG" 2>&1 || true
+    have "$COMP" || die "modified MetaBAT2 did not write composite_raw.lp"
+  fi
+elif have "$FEAT"; then log "2) contig features — skip (exist)"
 else
-  log "2) modified MetaBAT2 (composite_raw.lp dump)"
-  # the modified binary may need its build's shared libraries; set METABAT2_MODIFIED_LIBS in config.sh if so
-  ( cd "$WORK/moddump" && LD_LIBRARY_PATH="${MODMB2_LIBS:-}:${LD_LIBRARY_PATH:-}" \
-       "$MODMB2" -i "$FASTA" -a "$DEPTH" -o "$WORK/moddump/bin" -m "$MINLEN" --seed 1 ) \
-       >>"$LOG" 2>&1 || true
-  have "$COMP" || die "modified MetaBAT2 did not write composite_raw.lp"
+  log "2) contig features (TNF and coverage)"
+  $PY "$S/mb2_features.py" features --fasta "$FASTA" --depth "$DEPTH" --minlen "$MINLEN" \
+       --out "$FEAT" 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" = 0 ] && have "$FEAT" || { rm -f "$FEAT"; die "the contig features could not be computed (see above)"; }
+fi
+if [ "$BACKEND" = metabat2 ]; then :
+elif have "$COMP"; then log "   native composite — skip (exist)"
+else
+  log "   native composite (MetaBAT2's similarity graph)"
+  $PY "$S/mb2_features.py" composite --features "$FEAT" --out "$COMP.partial" \
+       --threads "$THREADS" --seed 1 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" = 0 ] && have "$COMP.partial" || die "the native composite could not be computed (see above)"
+  mv "$COMP.partial" "$COMP"
 fi
 AFF="$F/affinity_native_top5.lp"
 have "$AFF" || $PY "$S/build_affinity.py" "$DICT" "$COMP" "$AFF" 1000 5 2>&1 | tee -a "$LOG"
 
 # ---- 3) the distance threshold, from the SEED ---------------------------------
-# NB comarker_sim comes from MetaBAT2's OWN cal_tnf_dist + cal_abd_dist via the modified
-# binary's pair-dump mode, so D is on the 0..200 scale the threshold is read on.
-MODLD="${MODMB2_LIBS:-}:${LD_LIBRARY_PATH:-}"   # libraries for the modified binary, scoped to its calls
+# NB comarker_sim comes from MetaBAT2's OWN cal_tnf_dist + cal_abd_dist (ported in
+# mb2_features.py, or the binary's pair-dump mode), so D is on the 0..200 scale the threshold is
+# read on.
+if [ "$BACKEND" = python ]; then SRC=(--features "$FEAT")
+else SRC=(--metabat2 "$MODMB2" --fasta "$FASTA" --depth "$DEPTH" --minlen "$MINLEN"); fi
 comarker(){  # $1 mode  $2 out  $3.. extra args
   local mode="$1" out="$2"; shift 2
   LD_LIBRARY_PATH="$MODLD" $PY "$S/build_comarker.py" --mode "$mode" \
-       --dict "$DICT" --mg "$MG" --fasta "$FASTA" --depth "$DEPTH" \
-       --metabat2 "$MODMB2" --minlen "$MINLEN" --out "$out" "$@" 2>&1 | tee -a "$LOG"
+       --dict "$DICT" --mg "$MG" "${SRC[@]}" --out "$out" "$@" 2>&1 | tee -a "$LOG"
 }
 # SIMTHRESH IS DERIVED, not carried over. The threshold is the cut that best separates the
 # co-marker pairs the SEED puts in the same bin from those it puts in different bins, with no
